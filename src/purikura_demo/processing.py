@@ -675,8 +675,6 @@ def _build_part_masks(shape: tuple[int, int], faces: list[FaceRegion]) -> PartMa
             _fill_landmark_polygon(cheeks, face, LEFT_CHEEK, 170)
             _fill_landmark_polygon(cheeks, face, RIGHT_CHEEK, 170)
             _fill_landmark_polyline(highlights, face, NOSE_BRIDGE, 160, width=max(2, round(face.w * 0.025)))
-            for cx, cy, radius in face.eyes:
-                cv2.circle(highlights, (round(cx + radius * 0.22), round(cy - radius * 0.22)), max(2, round(radius * 0.18)), 210, -1)
             hair_top = max(0, round(face.y - face.h * 0.16))
             hair_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.13))
             hair_axes = (round(face.w * 0.55), round(face.h * 0.30))
@@ -699,7 +697,6 @@ def _build_part_masks(shape: tuple[int, int], faces: list[FaceRegion]) -> PartMa
         else:
             for cx, cy, radius in face.eyes:
                 cv2.circle(eyes, (round(cx), round(cy)), round(radius * 1.18), 255, -1)
-                cv2.circle(highlights, (round(cx + radius * 0.22), round(cy - radius * 0.22)), max(2, round(radius * 0.18)), 210, -1)
 
             center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.52))
             cv2.ellipse(face_skin, center, (round(face.w * 0.48), round(face.h * 0.55)), 0, 0, 360, 210, -1)
@@ -779,8 +776,6 @@ def _apply_local_beauty_layers(
         eye_detail = _sample_match_eye_detail(eye_detail)
     eye_detail = match_boundary_tone(rgb, eye_detail, eyes_region.transition)
     out = _blend_with_float_mask(out, eye_detail, eyes_region.alpha, 0.70 if settings.preset == "sample_match" else 0.62)
-    highlight_region = build_feathered_region(parts.highlights, inner_px=2, outer_px=10)
-    out = _screen_with_float_mask(out, np.full_like(rgb, (255, 245, 252), dtype=np.uint8), highlight_region.alpha, 0.55)
 
     cheek_color = np.full_like(rgb, (255, 120, 170), dtype=np.uint8)
     lip_color = np.full_like(rgb, (218, 72, 118), dtype=np.uint8)
