@@ -152,6 +152,8 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
         retouched = _apply_local_beauty_layers(retouched, faces, skin_mask, settings)
     toned = _apply_color_preset(retouched, skin_mask, settings)
     polished = _apply_glow_and_grain(toned, settings)
+    if settings.pipeline == "quality" and faces:
+        polished = _polish_retouch_boundaries(polished, warped, skin_mask, faces, settings)
     decorated = _draw_decorations(polished, settings) if settings.decorations else polished
 
     output = Image.fromarray(decorated).convert("RGB")
@@ -443,8 +445,10 @@ def _add_eye_enlarge_map(
 
     region_x = map_x[y0:y1, x0:x1]
     region_y = map_y[y0:y1, x0:x1]
-    region_x[mask] = cx + dx[mask] / scale[mask]
-    region_y[mask] = cy + dy[mask] / scale[mask]
+    target_x = cx + dx / scale
+    target_y = cy + dy / scale
+    region_x[mask] += (target_x - xx.astype(np.float32))[mask]
+    region_y[mask] += (target_y - yy.astype(np.float32))[mask]
 
 
 def _add_face_slim_map(map_x: np.ndarray, face: FaceRegion, strength: float) -> None:
@@ -470,7 +474,8 @@ def _add_face_slim_map(map_x: np.ndarray, face: FaceRegion, strength: float) -> 
 
     region_x = map_x[y0:y1, x0:x1]
     dx = xx.astype(np.float32) - cx
-    region_x[mask] = cx + dx[mask] / scale[mask]
+    target_x = cx + dx / scale
+    region_x[mask] += (target_x - xx.astype(np.float32))[mask]
 
 
 def _repair_warp_boundary(original: np.ndarray, warped: np.ndarray, support_mask: np.ndarray) -> np.ndarray:
@@ -899,6 +904,18 @@ def suppress_mask_on_edges(mask: np.ndarray, rgb: np.ndarray) -> np.ndarray:
     return np.clip(suppressed * 255.0, 0, 255).astype(np.uint8)
 
 
+def _edge_limited_boundary_mask(mask: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    edge = cv2.magnitude(grad_x, grad_y)
+    if float(edge.max()) > 0.0:
+        edge /= float(edge.max())
+    edge = cv2.GaussianBlur(edge, (0, 0), sigmaX=3.5)
+    expanded = cv2.GaussianBlur(np.clip(mask.astype(np.float32), 0.0, 1.0), (0, 0), sigmaX=7.0)
+    return np.clip(expanded * (0.68 + edge * 0.54), 0.0, 1.0).astype(np.float32)
+
+
 def match_boundary_tone(base: np.ndarray, layer: np.ndarray, transition_mask: np.ndarray) -> np.ndarray:
     transition = np.clip(transition_mask.astype(np.float32), 0.0, 1.0)
     if transition.max() <= 0.0:
@@ -1040,7 +1057,8 @@ def _apply_sample_match_color(
     hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.025 + 2.0, 0, 255)
     matched = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
 
-    skin = skin_mask.astype(np.float32) / 255.0
+    skin_region = build_feathered_region(suppress_mask_on_edges(skin_mask, rgb), inner_px=20, outer_px=74)
+    skin = np.clip(skin_region.core + skin_region.transition * 0.34, 0.0, 1.0)
     skin_lab = cv2.cvtColor(matched, cv2.COLOR_RGB2LAB).astype(np.float32)
     skin_lab[:, :, 0] += skin * (2.8 + 1.2 * intensity)
     skin_lab[:, :, 1] += skin * 1.6
@@ -1048,6 +1066,40 @@ def _apply_sample_match_color(
     matched = cv2.cvtColor(np.clip(skin_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
 
     return _apply_gamma(matched, 0.985)
+
+
+def _polish_retouch_boundaries(
+    rgb: np.ndarray,
+    guide: np.ndarray,
+    skin_mask: np.ndarray,
+    faces: list[FaceRegion],
+    settings: PurikuraSettings,
+) -> np.ndarray:
+    parts = _build_part_masks(rgb.shape[:2], faces)
+    skin_region = build_feathered_region(suppress_mask_on_edges(skin_mask, guide), inner_px=12, outer_px=92)
+    face_region = build_feathered_region(parts.face_skin, inner_px=10, outer_px=74)
+    eyes_region = build_feathered_region(parts.eyes, inner_px=6, outer_px=34)
+    lips_region = build_feathered_region(parts.lips, inner_px=5, outer_px=28)
+    hair_region = build_feathered_region(_refine_hair_mask(guide, parts.hair, skin_mask, settings), inner_px=8, outer_px=58)
+    boundary = np.maximum.reduce(
+        (
+            skin_region.transition,
+            face_region.transition * 0.85,
+            eyes_region.transition * 0.70,
+            lips_region.transition * 0.52,
+            hair_region.transition * 0.50,
+        )
+    )
+    if boundary.max() <= 0.0:
+        return rgb
+
+    edge_limited = _edge_limited_boundary_mask(boundary, rgb)
+    tone_matched = match_boundary_tone(guide, rgb, edge_limited)
+    smoothed = cv2.bilateralFilter(np.clip(rgb, 0, 255).astype(np.uint8), d=9, sigmaColor=28, sigmaSpace=7)
+    smoothed = cv2.addWeighted(smoothed, 0.70, cv2.GaussianBlur(smoothed, (0, 0), 1.2), 0.30, 0)
+    repaired = _blend_with_float_mask(rgb.astype(np.float32), tone_matched, edge_limited, 0.58)
+    repaired = _blend_with_float_mask(repaired, smoothed, edge_limited, 0.34)
+    return np.clip(repaired, 0, 255).astype(np.uint8)
 
 
 def _accelerator_name() -> str:
