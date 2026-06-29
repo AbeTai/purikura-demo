@@ -1,6 +1,13 @@
 <article class="result-card">
-  <div class="image-stage">
-    <img src="{{ image_data }}" alt="プリクラ風に加工した画像" />
+  <div class="compare-grid">
+    <figure class="image-card">
+      <figcaption>Original</figcaption>
+      <img src="{{ original_image_data }}" alt="元画像" />
+    </figure>
+    <figure class="image-card">
+      <figcaption>Processed</figcaption>
+      <img src="{{ image_data }}" alt="プリクラ風に加工した画像" />
+    </figure>
   </div>
   <dl class="metrics">
     <div>
@@ -21,4 +28,8 @@
     </div>
   </dl>
   <a class="download-link" href="{{ image_data }}" download="purikura-demo.jpg">Download</a>
+  <figure class="debug-card">
+    <figcaption>Segmentation Debug</figcaption>
+    <img src="{{ segmentation_image_data }}" alt="セグメンテーションデバッグ画像" />
+  </figure>
 </article>

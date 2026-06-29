@@ -29,6 +29,9 @@ def test_process_image_returns_result_partial() -> None:
 
     assert response.status_code == 200
     assert "data:image/jpeg;base64" in response.text
+    assert "Original" in response.text
+    assert "Processed" in response.text
+    assert "Segmentation Debug" in response.text
     assert "Download" in response.text
     assert "strong" in response.text
 

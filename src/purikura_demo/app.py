@@ -67,12 +67,16 @@ async def process_image(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    encoded = base64.b64encode(result.image_bytes).decode("ascii")
+    original_encoded = base64.b64encode(result.original_bytes).decode("ascii")
+    processed_encoded = base64.b64encode(result.image_bytes).decode("ascii")
+    segmentation_encoded = base64.b64encode(result.segmentation_bytes).decode("ascii")
     return templates.TemplateResponse(
         request,
         "_result.html",
         {
-            "image_data": f"data:image/jpeg;base64,{encoded}",
+            "original_image_data": f"data:image/jpeg;base64,{original_encoded}",
+            "image_data": f"data:image/jpeg;base64,{processed_encoded}",
+            "segmentation_image_data": f"data:image/jpeg;base64,{segmentation_encoded}",
             "metrics": result.metrics,
             "settings": asdict(settings),
         },

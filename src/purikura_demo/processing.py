@@ -43,6 +43,8 @@ class PurikuraSettings:
 @dataclass(frozen=True)
 class ProcessedImage:
     image_bytes: bytes
+    original_bytes: bytes
+    segmentation_bytes: bytes
     metrics: dict[str, Any]
 
 
@@ -71,16 +73,21 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
     if faces:
         warped = _apply_geometry_warp(warped, faces, settings)
 
-    retouched = _apply_skin_retouch(warped, faces, settings)
+    skin_mask = _build_skin_mask(warped, faces)
+    if skin_mask.max() == 0:
+        skin_mask = _soft_full_image_mask(warped.shape[:2])
+
+    retouched = _apply_skin_retouch(warped, skin_mask, settings)
     toned = _apply_color_preset(retouched, settings)
     polished = _apply_glow_and_grain(toned, settings)
     decorated = _draw_decorations(polished, settings) if settings.decorations else polished
 
     output = Image.fromarray(decorated).convert("RGB")
-    buffer = io.BytesIO()
-    output.save(buffer, format="JPEG", quality=94, optimize=True)
+    segmentation = Image.fromarray(_build_segmentation_debug(rgb, faces, skin_mask)).convert("RGB")
     return ProcessedImage(
-        image_bytes=buffer.getvalue(),
+        image_bytes=_encode_jpeg(output, quality=94),
+        original_bytes=_encode_jpeg(Image.fromarray(rgb).convert("RGB"), quality=92),
+        segmentation_bytes=_encode_jpeg(segmentation, quality=92),
         metrics={
             "width": output.width,
             "height": output.height,
@@ -106,6 +113,12 @@ def _resize_to_limit(image: Image.Image, max_side: int) -> Image.Image:
     if scale >= 1.0:
         return image
     return image.resize((round(width * scale), round(height * scale)), Image.Resampling.LANCZOS)
+
+
+def _encode_jpeg(image: Image.Image, quality: int) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return buffer.getvalue()
 
 
 def _clamp_settings(settings: PurikuraSettings) -> PurikuraSettings:
@@ -139,11 +152,26 @@ def _effective_strength(value: float, settings: PurikuraSettings, cap: float = 1
 def _detect_faces_and_eyes(rgb: np.ndarray) -> list[FaceRegion]:
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    profile_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
     eye_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 
-    detected = face_detector.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=5, minSize=(80, 80))
+    min_side = max(48, min(rgb.shape[:2]) // 12)
+    detected = list(face_detector.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=5, minSize=(min_side, min_side)))
+    detected.extend(profile_detector.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=5, minSize=(min_side, min_side)))
+
+    flipped = cv2.flip(gray, 1)
+    image_width = gray.shape[1]
+    for px, py, pw, ph in profile_detector.detectMultiScale(
+        flipped,
+        scaleFactor=1.08,
+        minNeighbors=5,
+        minSize=(min_side, min_side),
+    ):
+        detected.append((image_width - px - pw, py, pw, ph))
+
+    detected = _dedupe_face_boxes(detected)
     faces: list[FaceRegion] = []
-    for x, y, w, h in detected[:6]:
+    for x, y, w, h in detected[:8]:
         face_gray = gray[y : y + h, x : x + w]
         upper = face_gray[: max(1, int(h * 0.62)), :]
         raw_eyes = eye_detector.detectMultiScale(
@@ -155,6 +183,26 @@ def _detect_faces_and_eyes(rgb: np.ndarray) -> list[FaceRegion]:
         eyes = _normalize_eyes(raw_eyes, x, y, w, h)
         faces.append(FaceRegion(int(x), int(y), int(w), int(h), eyes))
     return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
+
+
+def _dedupe_face_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    kept: list[tuple[int, int, int, int]] = []
+    for box in sorted(boxes, key=lambda item: item[2] * item[3], reverse=True):
+        if all(_box_iou(box, existing) < 0.28 for existing in kept):
+            kept.append(tuple(int(value) for value in box))
+    return kept
+
+
+def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x0 = max(ax, bx)
+    y0 = max(ay, by)
+    x1 = min(ax + aw, bx + bw)
+    y1 = min(ay + ah, by + bh)
+    inter = max(0, x1 - x0) * max(0, y1 - y0)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union else 0.0
 
 
 def _normalize_eyes(
@@ -262,13 +310,9 @@ def _add_face_slim_map(map_x: np.ndarray, face: FaceRegion, strength: float) -> 
     region_x[mask] = cx + dx[mask] / scale[mask]
 
 
-def _apply_skin_retouch(rgb: np.ndarray, faces: list[FaceRegion], settings: PurikuraSettings) -> np.ndarray:
+def _apply_skin_retouch(rgb: np.ndarray, mask: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
     if settings.skin_smoothing <= 0:
         return rgb
-
-    mask = _build_skin_mask(rgb, faces)
-    if mask.max() == 0:
-        mask = _soft_full_image_mask(rgb.shape[:2])
 
     strength = _effective_strength(settings.skin_smoothing, settings, cap=1.35)
     smoothed = cv2.bilateralFilter(rgb, d=9, sigmaColor=38 + strength * 38, sigmaSpace=7)
@@ -312,6 +356,45 @@ def _build_skin_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> np.ndarray:
     protect = cv2.GaussianBlur(protect_mask, (0, 0), sigmaX=4.0).astype(np.float32) / 255.0
     mask *= 1.0 - protect * 0.82
     return np.clip(mask * 255.0, 0, 255).astype(np.uint8)
+
+
+def _build_segmentation_debug(rgb: np.ndarray, faces: list[FaceRegion], skin_mask: np.ndarray) -> np.ndarray:
+    base = rgb.astype(np.float32)
+    mask = skin_mask.astype(np.float32) / 255.0
+    overlay_color = np.zeros_like(base)
+    overlay_color[:, :, 0] = 255
+    overlay_color[:, :, 1] = 91
+    overlay_color[:, :, 2] = 151
+    alpha = (0.50 * mask)[:, :, None]
+    debug = np.clip(base * (1.0 - alpha) + overlay_color * alpha, 0, 255).astype(np.uint8)
+
+    for index, face in enumerate(faces, start=1):
+        cv2.rectangle(debug, (face.x, face.y), (face.x + face.w, face.y + face.h), (21, 168, 143), 3)
+        cv2.putText(
+            debug,
+            f"face {index}",
+            (face.x, max(20, face.y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (21, 168, 143),
+            2,
+            cv2.LINE_AA,
+        )
+        for cx, cy, radius in face.eyes:
+            cv2.circle(debug, (round(cx), round(cy)), round(radius), (244, 198, 79), 2)
+
+    if not faces:
+        cv2.putText(
+            debug,
+            "no face detected: fallback soft mask",
+            (24, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (241, 95, 154),
+            2,
+            cv2.LINE_AA,
+        )
+    return debug
 
 
 def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:

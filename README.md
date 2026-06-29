@@ -8,13 +8,15 @@
 
 - FastAPI による画像アップロード API
 - htmx による結果部分の非同期差し替え
-- OpenCV Haar cascade による顔・目の簡易検出
+- OpenCV Haar cascade による複数人の顔・目の簡易検出
 - 境界フェザーつき逆写像ワープによる目拡大
 - 境界で自然に戻る楕円 ROI の簡易小顔ワープ
 - 顔・首周辺のソフトマスクつき bilateral / Gaussian blend
 - Lab / HSV ベースのプリセット色調補正
 - Screen blend のソフトグロー、粒状ノイズ、フレーム、スタンプ風装飾
 - `Natural / Strong / Max` の加工強度モード
+- 元画像と加工後画像の比較表示
+- 顔 bbox、目領域、肌マスクを重ねたセグメンテーションデバッグ表示
 
 ## Setup
 
