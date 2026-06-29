@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Purikura Demo</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}" />
+    <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace" aria-label="Purikura editor">
+        <form
+          class="controls"
+          hx-post="/process"
+          hx-target="#result"
+          hx-swap="innerHTML"
+          hx-encoding="multipart/form-data"
+          enctype="multipart/form-data"
+          method="post"
+        >
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <h1>Purikura Demo</h1>
+          </div>
+
+          <label class="file-drop">
+            <input id="image" name="image" type="file" accept="image/*" required />
+            <span>画像を選択</span>
+          </label>
+
+          <div class="field">
+            <label for="preset">Preset</label>
+            <select id="preset" name="preset">
+              {% for key, label in presets %}
+              <option value="{{ key }}" {% if settings.preset == key %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="slider-field">
+            <label for="purikura_intensity">Purikura</label>
+            <input id="purikura_intensity" name="purikura_intensity" type="range" min="0" max="1" step="0.01" value="{{ settings.purikura_intensity }}" />
+          </div>
+
+          <div class="slider-field">
+            <label for="skin_smoothing">Skin</label>
+            <input id="skin_smoothing" name="skin_smoothing" type="range" min="0" max="1" step="0.01" value="{{ settings.skin_smoothing }}" />
+          </div>
+
+          <div class="slider-field">
+            <label for="eye_enlarge">Eyes</label>
+            <input id="eye_enlarge" name="eye_enlarge" type="range" min="0" max="1" step="0.01" value="{{ settings.eye_enlarge }}" />
+          </div>
+
+          <div class="slider-field">
+            <label for="face_slim">Face</label>
+            <input id="face_slim" name="face_slim" type="range" min="0" max="1" step="0.01" value="{{ settings.face_slim }}" />
+          </div>
+
+          <div class="slider-field">
+            <label for="glow">Glow</label>
+            <input id="glow" name="glow" type="range" min="0" max="1" step="0.01" value="{{ settings.glow }}" />
+          </div>
+
+          <label class="toggle">
+            <input name="decorations" type="checkbox" value="true" checked />
+            <span>Frame</span>
+          </label>
+
+          <button class="primary-button" type="submit">
+            <span aria-hidden="true">↧</span>
+            加工する
+          </button>
+        </form>
+
+        <section id="result" class="result-panel" aria-live="polite">
+          <div class="empty-state">
+            <div class="empty-frame"></div>
+            <p>加工結果がここに表示されます</p>
+          </div>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>
