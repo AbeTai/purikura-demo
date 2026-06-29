@@ -39,6 +39,15 @@
           </div>
 
           <div class="field">
+            <label for="pipeline">Pipeline</label>
+            <select id="pipeline" name="pipeline">
+              {% for key, label in pipelines %}
+              <option value="{{ key }}" {% if settings.pipeline == key %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="field">
             <label for="effect_mode">Power</label>
             <select id="effect_mode" name="effect_mode">
               {% for key, label in effect_modes %}

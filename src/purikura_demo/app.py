@@ -26,6 +26,7 @@ async def index(request: Request) -> HTMLResponse:
         {
             "settings": PurikuraSettings(),
             "presets": PurikuraSettings.available_presets(),
+            "pipelines": PurikuraSettings.available_pipelines(),
             "effect_modes": PurikuraSettings.available_effect_modes(),
         },
     )
@@ -36,6 +37,7 @@ async def process_image(
     request: Request,
     image: UploadFile = File(...),
     preset: str = Form("strawberry"),
+    pipeline: str = Form("quality"),
     effect_mode: str = Form("normal"),
     purikura_intensity: float = Form(0.78),
     skin_smoothing: float = Form(0.72),
@@ -53,6 +55,7 @@ async def process_image(
 
     settings = PurikuraSettings(
         preset=preset,
+        pipeline=pipeline,
         effect_mode=effect_mode,
         purikura_intensity=purikura_intensity,
         skin_smoothing=skin_smoothing,

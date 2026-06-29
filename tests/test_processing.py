@@ -37,6 +37,8 @@ def test_strong_effect_mode_is_reported() -> None:
     result = apply_purikura_effect(source, PurikuraSettings(effect_mode="max", eye_enlarge=1.0, face_slim=1.0))
 
     assert result.metrics["mode"] == "max"
+    assert result.metrics["pipeline"] == "quality"
+    assert result.metrics["accelerator"] in {"opencv-cpu", "torch-mps"}
 
 
 def test_skin_mask_combines_multiple_faces() -> None:

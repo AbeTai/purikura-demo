@@ -15,6 +15,7 @@ def test_index_renders() -> None:
     assert response.status_code == 200
     assert "Purikura Demo" in response.text
     assert "hx-post=\"/process\"" in response.text
+    assert "name=\"pipeline\"" in response.text
     assert "name=\"effect_mode\"" in response.text
 
 
@@ -24,7 +25,7 @@ def test_process_image_returns_result_partial() -> None:
     response = client.post(
         "/process",
         files={"image": ("sample.png", image_bytes, "image/png")},
-        data={"preset": "natural", "effect_mode": "strong", "decorations": "true"},
+        data={"preset": "natural", "pipeline": "quality", "effect_mode": "strong", "decorations": "true"},
     )
 
     assert response.status_code == 200
@@ -34,6 +35,7 @@ def test_process_image_returns_result_partial() -> None:
     assert "Segmentation Debug" in response.text
     assert "Download" in response.text
     assert "strong" in response.text
+    assert "quality" in response.text
 
 
 def _sample_image() -> bytes:

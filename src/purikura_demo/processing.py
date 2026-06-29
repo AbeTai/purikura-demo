@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw, ImageFilter
 @dataclass(frozen=True)
 class PurikuraSettings:
     preset: str = "strawberry"
+    pipeline: str = "quality"
     effect_mode: str = "normal"
     purikura_intensity: float = 0.78
     skin_smoothing: float = 0.72
@@ -37,6 +38,13 @@ class PurikuraSettings:
             ("normal", "Natural"),
             ("strong", "Strong"),
             ("max", "Max"),
+        )
+
+    @staticmethod
+    def available_pipelines() -> tuple[tuple[str, str], ...]:
+        return (
+            ("quality", "Quality"),
+            ("classic", "Classic"),
         )
 
 
@@ -78,12 +86,14 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
         skin_mask = _soft_full_image_mask(warped.shape[:2])
 
     retouched = _apply_skin_retouch(warped, skin_mask, settings)
-    toned = _apply_color_preset(retouched, settings)
+    if settings.pipeline == "quality":
+        retouched = _apply_local_beauty_layers(retouched, faces, skin_mask, settings)
+    toned = _apply_color_preset(retouched, skin_mask, settings)
     polished = _apply_glow_and_grain(toned, settings)
     decorated = _draw_decorations(polished, settings) if settings.decorations else polished
 
     output = Image.fromarray(decorated).convert("RGB")
-    segmentation = Image.fromarray(_build_segmentation_debug(rgb, faces, skin_mask)).convert("RGB")
+    segmentation = Image.fromarray(_build_segmentation_debug(rgb, faces, skin_mask, settings)).convert("RGB")
     return ProcessedImage(
         image_bytes=_encode_jpeg(output, quality=94),
         original_bytes=_encode_jpeg(Image.fromarray(rgb).convert("RGB"), quality=92),
@@ -94,6 +104,8 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
             "faces": len(faces),
             "preset": settings.preset,
             "mode": settings.effect_mode,
+            "pipeline": settings.pipeline,
+            "accelerator": _accelerator_name(),
         },
     )
 
@@ -126,11 +138,14 @@ def _clamp_settings(settings: PurikuraSettings) -> PurikuraSettings:
         return max(0.0, min(1.0, float(value)))
 
     preset_names = {key for key, _ in PurikuraSettings.available_presets()}
+    pipeline_names = {key for key, _ in PurikuraSettings.available_pipelines()}
     mode_names = {key for key, _ in PurikuraSettings.available_effect_modes()}
     preset = settings.preset if settings.preset in preset_names else "strawberry"
+    pipeline = settings.pipeline if settings.pipeline in pipeline_names else "quality"
     effect_mode = settings.effect_mode if settings.effect_mode in mode_names else "normal"
     return PurikuraSettings(
         preset=preset,
+        pipeline=pipeline,
         effect_mode=effect_mode,
         purikura_intensity=unit(settings.purikura_intensity),
         skin_smoothing=unit(settings.skin_smoothing),
@@ -315,14 +330,30 @@ def _apply_skin_retouch(rgb: np.ndarray, mask: np.ndarray, settings: PurikuraSet
         return rgb
 
     strength = _effective_strength(settings.skin_smoothing, settings, cap=1.35)
-    smoothed = cv2.bilateralFilter(rgb, d=9, sigmaColor=38 + strength * 38, sigmaSpace=7)
-    smoothed = cv2.GaussianBlur(smoothed, (0, 0), sigmaX=0.7 + strength * 1.8)
-    broader = cv2.GaussianBlur(rgb, (0, 0), sigmaX=2.5 + strength * 2.0)
-    detail = cv2.addWeighted(rgb, 1.15, broader, -0.15, 0)
-    retouch = cv2.addWeighted(smoothed, 0.88, detail, 0.12, 0)
+    if settings.pipeline == "quality":
+        retouch = _frequency_separated_skin(rgb, strength)
+    else:
+        smoothed = cv2.bilateralFilter(rgb, d=9, sigmaColor=38 + strength * 38, sigmaSpace=7)
+        smoothed = cv2.GaussianBlur(smoothed, (0, 0), sigmaX=0.7 + strength * 1.8)
+        broader = cv2.GaussianBlur(rgb, (0, 0), sigmaX=2.5 + strength * 2.0)
+        detail = cv2.addWeighted(rgb, 1.15, broader, -0.15, 0)
+        retouch = cv2.addWeighted(smoothed, 0.88, detail, 0.12, 0)
 
     alpha = (mask.astype(np.float32) / 255.0)[:, :, None] * min(0.92, 0.26 + 0.52 * strength)
     return np.clip(rgb.astype(np.float32) * (1.0 - alpha) + retouch.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+
+
+def _frequency_separated_skin(rgb: np.ndarray, strength: float) -> np.ndarray:
+    sigma = 2.4 + 2.2 * strength
+    low = cv2.GaussianBlur(rgb, (0, 0), sigmaX=sigma)
+    try:
+        edge_smooth = cv2.edgePreservingFilter(rgb, flags=1, sigma_s=38 + 18 * strength, sigma_r=0.20 + 0.08 * strength)
+    except cv2.error:
+        edge_smooth = cv2.bilateralFilter(rgb, d=11, sigmaColor=48 + strength * 44, sigmaSpace=9)
+    high = rgb.astype(np.float32) - low.astype(np.float32)
+    detail_keep = 0.62 - 0.18 * min(strength, 1.0)
+    retouch = edge_smooth.astype(np.float32) + high * detail_keep
+    return np.clip(retouch, 0, 255).astype(np.uint8)
 
 
 def _build_skin_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> np.ndarray:
@@ -358,7 +389,12 @@ def _build_skin_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> np.ndarray:
     return np.clip(mask * 255.0, 0, 255).astype(np.uint8)
 
 
-def _build_segmentation_debug(rgb: np.ndarray, faces: list[FaceRegion], skin_mask: np.ndarray) -> np.ndarray:
+def _build_segmentation_debug(
+    rgb: np.ndarray,
+    faces: list[FaceRegion],
+    skin_mask: np.ndarray,
+    settings: PurikuraSettings,
+) -> np.ndarray:
     base = rgb.astype(np.float32)
     mask = skin_mask.astype(np.float32) / 255.0
     overlay_color = np.zeros_like(base)
@@ -367,6 +403,11 @@ def _build_segmentation_debug(rgb: np.ndarray, faces: list[FaceRegion], skin_mas
     overlay_color[:, :, 2] = 151
     alpha = (0.50 * mask)[:, :, None]
     debug = np.clip(base * (1.0 - alpha) + overlay_color * alpha, 0, 255).astype(np.uint8)
+    if settings.pipeline == "quality":
+        parts = _build_part_masks(rgb.shape[:2], faces)
+        debug = _debug_overlay_mask(debug, parts.cheeks, (255, 150, 188), 0.42)
+        debug = _debug_overlay_mask(debug, parts.lips, (230, 72, 118), 0.45)
+        debug = _debug_overlay_mask(debug, parts.hair, (80, 110, 130), 0.35)
 
     for index, face in enumerate(faces, start=1):
         cv2.rectangle(debug, (face.x, face.y), (face.x + face.w, face.y + face.h), (21, 168, 143), 3)
@@ -397,6 +438,129 @@ def _build_segmentation_debug(rgb: np.ndarray, faces: list[FaceRegion], skin_mas
     return debug
 
 
+@dataclass(frozen=True)
+class PartMasks:
+    eyes: np.ndarray
+    cheeks: np.ndarray
+    lips: np.ndarray
+    hair: np.ndarray
+    highlights: np.ndarray
+
+
+def _build_part_masks(shape: tuple[int, int], faces: list[FaceRegion]) -> PartMasks:
+    height, width = shape
+    eyes = np.zeros((height, width), dtype=np.uint8)
+    cheeks = np.zeros((height, width), dtype=np.uint8)
+    lips = np.zeros((height, width), dtype=np.uint8)
+    hair = np.zeros((height, width), dtype=np.uint8)
+    highlights = np.zeros((height, width), dtype=np.uint8)
+
+    for face in faces:
+        for cx, cy, radius in face.eyes:
+            cv2.circle(eyes, (round(cx), round(cy)), round(radius * 1.18), 255, -1)
+            cv2.circle(highlights, (round(cx + radius * 0.22), round(cy - radius * 0.22)), max(2, round(radius * 0.18)), 210, -1)
+
+        cheek_y = round(face.y + face.h * 0.60)
+        cheek_axes = (round(face.w * 0.15), round(face.h * 0.075))
+        cv2.ellipse(cheeks, (round(face.x + face.w * 0.33), cheek_y), cheek_axes, -8, 0, 360, 190, -1)
+        cv2.ellipse(cheeks, (round(face.x + face.w * 0.67), cheek_y), cheek_axes, 8, 0, 360, 190, -1)
+
+        mouth_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.73))
+        cv2.ellipse(lips, mouth_center, (round(face.w * 0.18), round(face.h * 0.065)), 0, 0, 360, 210, -1)
+
+        hair_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.16))
+        hair_axes = (round(face.w * 0.50), round(face.h * 0.28))
+        cv2.ellipse(hair, hair_center, hair_axes, 0, 180, 360, 160, -1)
+
+    return PartMasks(
+        eyes=cv2.GaussianBlur(eyes, (0, 0), sigmaX=3.0),
+        cheeks=cv2.GaussianBlur(cheeks, (0, 0), sigmaX=10.0),
+        lips=cv2.GaussianBlur(lips, (0, 0), sigmaX=2.8),
+        hair=cv2.GaussianBlur(hair, (0, 0), sigmaX=8.0),
+        highlights=cv2.GaussianBlur(highlights, (0, 0), sigmaX=2.0),
+    )
+
+
+def _apply_local_beauty_layers(
+    rgb: np.ndarray,
+    faces: list[FaceRegion],
+    skin_mask: np.ndarray,
+    settings: PurikuraSettings,
+) -> np.ndarray:
+    if not faces:
+        return rgb
+
+    strength = _mode_multiplier(settings)
+    parts = _build_part_masks(rgb.shape[:2], faces)
+    out = rgb.astype(np.float32)
+
+    out = _blend_with_mask(out, _unsharp(rgb, sigma=1.0, amount=0.75 + 0.18 * strength), parts.eyes, 0.62)
+    out = _screen_with_mask(out, np.full_like(rgb, (255, 245, 252), dtype=np.uint8), parts.highlights, 0.55)
+
+    cheek_color = np.full_like(rgb, (255, 120, 170), dtype=np.uint8)
+    lip_color = np.full_like(rgb, (218, 72, 118), dtype=np.uint8)
+    out = _soft_light_with_mask(out, cheek_color, parts.cheeks, 0.20 + 0.08 * strength)
+    out = _soft_light_with_mask(out, lip_color, parts.lips, 0.34 + 0.10 * strength)
+
+    hair_mask = _refine_hair_mask(rgb, parts.hair, skin_mask)
+    if hair_mask.max() > 0:
+        hair_smooth = cv2.bilateralFilter(rgb, d=7, sigmaColor=32, sigmaSpace=7)
+        hair_gloss = cv2.addWeighted(hair_smooth, 1.08, cv2.GaussianBlur(hair_smooth, (0, 0), 4.0), -0.08, 0)
+        out = _blend_with_mask(out, hair_gloss, hair_mask, 0.32)
+
+    skin_tone = _skin_tone_lift(np.clip(out, 0, 255).astype(np.uint8), settings)
+    out = _blend_with_mask(out, skin_tone, skin_mask, 0.42)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _refine_hair_mask(rgb: np.ndarray, rough_hair: np.ndarray, skin_mask: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    dark = cv2.inRange(hsv, np.array([0, 0, 0], dtype=np.uint8), np.array([180, 120, 105], dtype=np.uint8))
+    mask = (rough_hair.astype(np.float32) / 255.0) * (dark.astype(np.float32) / 255.0)
+    mask *= 1.0 - (skin_mask.astype(np.float32) / 255.0) * 0.55
+    return np.clip(cv2.GaussianBlur(mask, (0, 0), sigmaX=5.0) * 255.0, 0, 255).astype(np.uint8)
+
+
+def _skin_tone_lift(rgb: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
+    strength = _effective_strength(settings.skin_smoothing, settings, cap=1.25)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[:, :, 0] += 4.0 + 5.0 * strength
+    lab[:, :, 1] += 0.7 + 1.0 * strength
+    lab[:, :, 2] -= 0.6 + 1.5 * strength
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+
+def _unsharp(rgb: np.ndarray, sigma: float, amount: float) -> np.ndarray:
+    blur = cv2.GaussianBlur(rgb, (0, 0), sigmaX=sigma)
+    return cv2.addWeighted(rgb, 1.0 + amount, blur, -amount, 0)
+
+
+def _blend_with_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
+    alpha = (mask.astype(np.float32) / 255.0)[:, :, None] * opacity
+    return base * (1.0 - alpha) + layer.astype(np.float32) * alpha
+
+
+def _screen_with_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
+    screen = 255.0 - (255.0 - base) * (255.0 - layer.astype(np.float32)) / 255.0
+    return _blend_with_mask(base, screen.astype(np.uint8), mask, opacity)
+
+
+def _soft_light_with_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
+    cb = np.clip(base / 255.0, 0.0, 1.0)
+    cs = layer.astype(np.float32) / 255.0
+    soft = np.where(cs <= 0.5, cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb), cb + (2.0 * cs - 1.0) * (_soft_light_d(cb) - cb))
+    return _blend_with_mask(base, np.clip(soft * 255.0, 0, 255).astype(np.uint8), mask, opacity)
+
+
+def _soft_light_d(value: np.ndarray) -> np.ndarray:
+    return np.where(value <= 0.25, ((16 * value - 12) * value + 4) * value, np.sqrt(value))
+
+
+def _debug_overlay_mask(base: np.ndarray, mask: np.ndarray, color: tuple[int, int, int], opacity: float) -> np.ndarray:
+    overlay = np.full_like(base, color, dtype=np.uint8)
+    return _blend_with_mask(base.astype(np.float32), overlay, mask, opacity).astype(np.uint8)
+
+
 def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:
     height, width = shape
     mask = np.zeros((height, width), dtype=np.uint8)
@@ -404,8 +568,12 @@ def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:
     return cv2.GaussianBlur(mask, (0, 0), sigmaX=max(width, height) * 0.025)
 
 
-def _apply_color_preset(rgb: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
+def _apply_color_preset(rgb: np.ndarray, skin_mask: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
     intensity = _effective_strength(settings.purikura_intensity, settings, cap=1.35)
+    mps_result = _apply_mps_color_preset(rgb, skin_mask, settings, intensity)
+    if mps_result is not None:
+        return mps_result
+
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
 
@@ -445,6 +613,43 @@ def _apply_color_preset(rgb: np.ndarray, settings: PurikuraSettings) -> np.ndarr
     if settings.preset == "film":
         gamma = 1.04
     return _apply_gamma(mixed, gamma)
+
+
+def _accelerator_name() -> str:
+    try:
+        import torch  # type: ignore[import-not-found]
+    except Exception:
+        return "opencv-cpu"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "torch-mps"
+    return "opencv-cpu"
+
+
+def _apply_mps_color_preset(
+    rgb: np.ndarray,
+    skin_mask: np.ndarray,
+    settings: PurikuraSettings,
+    intensity: float,
+) -> np.ndarray | None:
+    if settings.pipeline != "quality":
+        return None
+    try:
+        import torch  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    if getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available():
+        return None
+
+    device = torch.device("mps")
+    image = torch.as_tensor(rgb, device=device, dtype=torch.float32) / 255.0
+    skin = torch.as_tensor(skin_mask, device=device, dtype=torch.float32).unsqueeze(-1) / 255.0
+    image = image.pow(max(0.78, 1.0 - 0.08 * intensity))
+    saturation = 1.0 + (0.08 if settings.preset != "film" else -0.04) * intensity
+    luma = (image[..., 0:1] * 0.2126 + image[..., 1:2] * 0.7152 + image[..., 2:3] * 0.0722)
+    image = luma + (image - luma) * saturation
+    skin_lift = torch.tensor([1.02, 0.985, 1.01], device=device, dtype=torch.float32)
+    image = image * (1.0 - skin * 0.20 * intensity) + torch.clamp(image * skin_lift + 0.025 * intensity, 0.0, 1.0) * skin * 0.20 * intensity
+    return torch.clamp(image * 255.0, 0, 255).to("cpu", dtype=torch.uint8).numpy()
 
 
 def _apply_gamma(rgb: np.ndarray, gamma: float) -> np.ndarray:
