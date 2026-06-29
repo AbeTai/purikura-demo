@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw, ImageFilter
 @dataclass(frozen=True)
 class PurikuraSettings:
     preset: str = "strawberry"
+    effect_mode: str = "normal"
     purikura_intensity: float = 0.78
     skin_smoothing: float = 0.72
     eye_enlarge: float = 0.55
@@ -28,6 +29,14 @@ class PurikuraSettings:
             ("cool", "透明感クール"),
             ("film", "フィルムポップ"),
             ("neon", "夜景ネオン"),
+        )
+
+    @staticmethod
+    def available_effect_modes() -> tuple[tuple[str, str], ...]:
+        return (
+            ("normal", "Natural"),
+            ("strong", "Strong"),
+            ("max", "Max"),
         )
 
 
@@ -77,6 +86,7 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
             "height": output.height,
             "faces": len(faces),
             "preset": settings.preset,
+            "mode": settings.effect_mode,
         },
     )
 
@@ -103,9 +113,12 @@ def _clamp_settings(settings: PurikuraSettings) -> PurikuraSettings:
         return max(0.0, min(1.0, float(value)))
 
     preset_names = {key for key, _ in PurikuraSettings.available_presets()}
+    mode_names = {key for key, _ in PurikuraSettings.available_effect_modes()}
     preset = settings.preset if settings.preset in preset_names else "strawberry"
+    effect_mode = settings.effect_mode if settings.effect_mode in mode_names else "normal"
     return PurikuraSettings(
         preset=preset,
+        effect_mode=effect_mode,
         purikura_intensity=unit(settings.purikura_intensity),
         skin_smoothing=unit(settings.skin_smoothing),
         eye_enlarge=unit(settings.eye_enlarge),
@@ -113,6 +126,14 @@ def _clamp_settings(settings: PurikuraSettings) -> PurikuraSettings:
         glow=unit(settings.glow),
         decorations=bool(settings.decorations),
     )
+
+
+def _mode_multiplier(settings: PurikuraSettings) -> float:
+    return {"normal": 1.0, "strong": 1.32, "max": 1.68}[settings.effect_mode]
+
+
+def _effective_strength(value: float, settings: PurikuraSettings, cap: float = 1.0) -> float:
+    return min(cap, value * _mode_multiplier(settings))
 
 
 def _detect_faces_and_eyes(rgb: np.ndarray) -> list[FaceRegion]:
@@ -172,10 +193,16 @@ def _apply_geometry_warp(rgb: np.ndarray, faces: list[FaceRegion], settings: Pur
 
     for face in faces:
         if settings.face_slim > 0:
-            _add_face_slim_map(map_x, face, settings.face_slim)
+            _add_face_slim_map(map_x, face, _effective_strength(settings.face_slim, settings, cap=1.25))
         if settings.eye_enlarge > 0:
             for cx, cy, radius in face.eyes:
-                _add_eye_enlarge_map(map_x, map_y, (cx, cy), radius * 1.28, settings.eye_enlarge)
+                _add_eye_enlarge_map(
+                    map_x,
+                    map_y,
+                    (cx, cy),
+                    radius * (1.28 + 0.10 * (_mode_multiplier(settings) - 1.0)),
+                    _effective_strength(settings.eye_enlarge, settings, cap=1.35),
+                )
 
     return cv2.remap(rgb, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
 
@@ -200,7 +227,8 @@ def _add_eye_enlarge_map(
     dy = yy.astype(np.float32) - cy
     distance = np.sqrt(dx * dx + dy * dy) / max(radius, 1.0)
     mask = distance < 1.0
-    scale = 1.0 + alpha * np.power(1.0 - distance, beta)
+    falloff = np.power(np.clip(1.0 - distance, 0.0, 1.0), beta)
+    scale = 1.0 + alpha * falloff
 
     region_x = map_x[y0:y1, x0:x1]
     region_y = map_y[y0:y1, x0:x1]
@@ -210,8 +238,8 @@ def _add_eye_enlarge_map(
 
 def _add_face_slim_map(map_x: np.ndarray, face: FaceRegion, strength: float) -> None:
     cx, cy = face.center
-    rx = face.w * 0.54
-    ry = face.h * 0.58
+    rx = face.w * 0.60
+    ry = face.h * 0.68
     x0 = max(int(cx - rx), 0)
     x1 = min(int(cx + rx) + 1, map_x.shape[1])
     y0 = max(int(cy - ry * 0.35), 0)
@@ -223,9 +251,10 @@ def _add_face_slim_map(map_x: np.ndarray, face: FaceRegion, strength: float) -> 
     ellipse = nx * nx + ny * ny
     lower_weight = np.clip((ny + 0.18) / 1.18, 0.0, 1.0)
     side_weight = np.clip(1.0 - np.abs(nx) ** 1.8, 0.0, 1.0)
+    boundary_weight = _smoothstep(0.0, 0.72, np.clip(1.0 - ellipse, 0.0, 1.0))
     mask = ellipse < 1.0
-    shrink = 0.04 + 0.17 * strength
-    scale = 1.0 - shrink * lower_weight * side_weight
+    shrink = 0.035 + 0.16 * strength
+    scale = 1.0 - shrink * lower_weight * side_weight * boundary_weight
     scale = np.clip(scale, 0.76, 1.0)
 
     region_x = map_x[y0:y1, x0:x1]
@@ -241,32 +270,48 @@ def _apply_skin_retouch(rgb: np.ndarray, faces: list[FaceRegion], settings: Puri
     if mask.max() == 0:
         mask = _soft_full_image_mask(rgb.shape[:2])
 
-    smoothed = cv2.bilateralFilter(rgb, d=9, sigmaColor=38 + settings.skin_smoothing * 34, sigmaSpace=7)
-    smoothed = cv2.GaussianBlur(smoothed, (0, 0), sigmaX=0.7 + settings.skin_smoothing * 1.5)
-    detail = cv2.addWeighted(rgb, 1.18, cv2.GaussianBlur(rgb, (0, 0), 2.0), -0.18, 0)
-    retouch = cv2.addWeighted(smoothed, 0.84, detail, 0.16, 0)
+    strength = _effective_strength(settings.skin_smoothing, settings, cap=1.35)
+    smoothed = cv2.bilateralFilter(rgb, d=9, sigmaColor=38 + strength * 38, sigmaSpace=7)
+    smoothed = cv2.GaussianBlur(smoothed, (0, 0), sigmaX=0.7 + strength * 1.8)
+    broader = cv2.GaussianBlur(rgb, (0, 0), sigmaX=2.5 + strength * 2.0)
+    detail = cv2.addWeighted(rgb, 1.15, broader, -0.15, 0)
+    retouch = cv2.addWeighted(smoothed, 0.88, detail, 0.12, 0)
 
-    alpha = (mask.astype(np.float32) / 255.0)[:, :, None] * (0.28 + 0.56 * settings.skin_smoothing)
+    alpha = (mask.astype(np.float32) / 255.0)[:, :, None] * min(0.92, 0.26 + 0.52 * strength)
     return np.clip(rgb.astype(np.float32) * (1.0 - alpha) + retouch.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
 
 
 def _build_skin_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> np.ndarray:
     height, width = rgb.shape[:2]
-    mask = np.zeros((height, width), dtype=np.uint8)
+    region_mask = np.zeros((height, width), dtype=np.uint8)
+    protect_mask = np.zeros((height, width), dtype=np.uint8)
     for face in faces:
         center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.52))
-        axes = (round(face.w * 0.43), round(face.h * 0.50))
-        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+        axes = (round(face.w * 0.54), round(face.h * 0.62))
+        cv2.ellipse(region_mask, center, axes, 0, 0, 360, 255, -1)
+
+        neck_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 1.04))
+        neck_axes = (round(face.w * 0.36), round(face.h * 0.30))
+        cv2.ellipse(region_mask, neck_center, neck_axes, 0, 0, 360, 150, -1)
 
         for cx, cy, radius in face.eyes:
-            cv2.circle(mask, (round(cx), round(cy)), round(radius * 0.92), 0, -1)
+            cv2.circle(protect_mask, (round(cx), round(cy)), round(radius * 1.04), 255, -1)
         mouth_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.73))
-        cv2.ellipse(mask, mouth_center, (round(face.w * 0.18), round(face.h * 0.08)), 0, 0, 360, 0, -1)
+        cv2.ellipse(protect_mask, mouth_center, (round(face.w * 0.20), round(face.h * 0.09)), 0, 0, 360, 255, -1)
 
     ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
     skin_color = cv2.inRange(ycrcb, np.array([0, 132, 70], dtype=np.uint8), np.array([255, 180, 145], dtype=np.uint8))
-    mask = cv2.bitwise_and(mask, cv2.dilate(skin_color, np.ones((5, 5), np.uint8), iterations=1))
-    return cv2.GaussianBlur(mask, (0, 0), sigmaX=5.0)
+    skin_color = cv2.dilate(skin_color, np.ones((9, 9), np.uint8), iterations=1)
+    skin_color = cv2.GaussianBlur(skin_color, (0, 0), sigmaX=8.0)
+    region_mask = cv2.GaussianBlur(region_mask, (0, 0), sigmaX=max(10.0, min(width, height) * 0.022))
+
+    region = region_mask.astype(np.float32) / 255.0
+    skin = skin_color.astype(np.float32) / 255.0
+    mask = region * (0.42 + 0.58 * skin)
+
+    protect = cv2.GaussianBlur(protect_mask, (0, 0), sigmaX=4.0).astype(np.float32) / 255.0
+    mask *= 1.0 - protect * 0.82
+    return np.clip(mask * 255.0, 0, 255).astype(np.uint8)
 
 
 def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:
@@ -277,7 +322,7 @@ def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:
 
 
 def _apply_color_preset(rgb: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
-    intensity = settings.purikura_intensity
+    intensity = _effective_strength(settings.purikura_intensity, settings, cap=1.35)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
 
@@ -326,7 +371,7 @@ def _apply_gamma(rgb: np.ndarray, gamma: float) -> np.ndarray:
 
 
 def _apply_glow_and_grain(rgb: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
-    glow_strength = settings.glow
+    glow_strength = _effective_strength(settings.glow, settings, cap=1.3)
     if glow_strength > 0:
         luminance = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         bright = cv2.threshold(luminance, 178, 255, cv2.THRESH_TOZERO)[1]
@@ -341,6 +386,11 @@ def _apply_glow_and_grain(rgb: np.ndarray, settings: PurikuraSettings) -> np.nda
         rgb = np.clip(rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         rgb = _add_vignette(rgb, amount=0.18)
     return rgb
+
+
+def _smoothstep(edge0: float, edge1: float, value: np.ndarray) -> np.ndarray:
+    t = np.clip((value - edge0) / max(edge1 - edge0, 1e-6), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
 
 def _add_vignette(rgb: np.ndarray, amount: float) -> np.ndarray:

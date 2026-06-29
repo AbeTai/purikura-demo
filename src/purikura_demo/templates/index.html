@@ -38,6 +38,15 @@
             </select>
           </div>
 
+          <div class="field">
+            <label for="effect_mode">Power</label>
+            <select id="effect_mode" name="effect_mode">
+              {% for key, label in effect_modes %}
+              <option value="{{ key }}" {% if settings.effect_mode == key %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
           <div class="slider-field">
             <label for="purikura_intensity">Purikura</label>
             <input id="purikura_intensity" name="purikura_intensity" type="range" min="0" max="1" step="0.01" value="{{ settings.purikura_intensity }}" />

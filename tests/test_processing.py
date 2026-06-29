@@ -25,6 +25,13 @@ def test_unknown_preset_falls_back_to_strawberry() -> None:
     assert result.metrics["preset"] == "strawberry"
 
 
+def test_strong_effect_mode_is_reported() -> None:
+    source = _sample_face_image()
+    result = apply_purikura_effect(source, PurikuraSettings(effect_mode="max", eye_enlarge=1.0, face_slim=1.0))
+
+    assert result.metrics["mode"] == "max"
+
+
 def _sample_face_image() -> bytes:
     image = Image.new("RGB", (420, 560), (238, 226, 222))
     draw = ImageDraw.Draw(image)
