@@ -9,6 +9,57 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
+FACE_OVAL = (
+    10,
+    338,
+    297,
+    332,
+    284,
+    251,
+    389,
+    356,
+    454,
+    323,
+    361,
+    288,
+    397,
+    365,
+    379,
+    378,
+    400,
+    377,
+    152,
+    148,
+    176,
+    149,
+    150,
+    136,
+    172,
+    58,
+    132,
+    93,
+    234,
+    127,
+    162,
+    21,
+    54,
+    103,
+    67,
+    109,
+)
+LEFT_EYE = (362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398)
+RIGHT_EYE = (33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246)
+LEFT_BROW = (276, 283, 282, 295, 285, 336, 296, 334, 293, 300)
+RIGHT_BROW = (46, 53, 52, 65, 55, 107, 66, 105, 63, 70)
+LIPS = (61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185)
+NOSE = (1, 2, 4, 5, 6, 45, 48, 64, 98, 97, 94, 326, 327, 294, 278, 275, 168, 197)
+NOSE_BRIDGE = (6, 168, 197, 195, 5, 4, 1, 2)
+LEFT_CHEEK = (50, 101, 118, 117, 123, 147, 187, 205)
+RIGHT_CHEEK = (280, 330, 347, 346, 352, 376, 411, 425)
+FOREHEAD = (10, 67, 109, 338, 297, 151, 9)
+LEFT_IRIS = (474, 475, 476, 477)
+RIGHT_IRIS = (469, 470, 471, 472)
+
 
 @dataclass(frozen=True)
 class PurikuraSettings:
@@ -63,6 +114,8 @@ class FaceRegion:
     w: int
     h: int
     eyes: tuple[tuple[float, float, float], ...]
+    landmarks: np.ndarray | None = None
+    detector: str = "opencv-haar"
 
     @property
     def center(self) -> tuple[float, float]:
@@ -106,6 +159,7 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
             "mode": settings.effect_mode,
             "pipeline": settings.pipeline,
             "accelerator": _accelerator_name(),
+            "segmenter": _segmenter_name(faces),
         },
     )
 
@@ -165,6 +219,10 @@ def _effective_strength(value: float, settings: PurikuraSettings, cap: float = 1
 
 
 def _detect_faces_and_eyes(rgb: np.ndarray) -> list[FaceRegion]:
+    mediapipe_faces = _detect_faces_with_mediapipe(rgb)
+    if mediapipe_faces:
+        return mediapipe_faces
+
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     profile_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
@@ -198,6 +256,69 @@ def _detect_faces_and_eyes(rgb: np.ndarray) -> list[FaceRegion]:
         eyes = _normalize_eyes(raw_eyes, x, y, w, h)
         faces.append(FaceRegion(int(x), int(y), int(w), int(h), eyes))
     return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
+
+
+def _detect_faces_with_mediapipe(rgb: np.ndarray) -> list[FaceRegion]:
+    try:
+        import mediapipe as mp  # type: ignore[import-not-found]
+    except Exception:
+        return []
+
+    height, width = rgb.shape[:2]
+    try:
+        with mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=8,
+            refine_landmarks=True,
+            min_detection_confidence=0.45,
+        ) as face_mesh:
+            result = face_mesh.process(rgb)
+    except Exception:
+        return []
+
+    faces: list[FaceRegion] = []
+    for face_landmarks in result.multi_face_landmarks or []:
+        landmarks = np.array(
+            [(point.x * width, point.y * height) for point in face_landmarks.landmark],
+            dtype=np.float32,
+        )
+        if landmarks.shape[0] < 468:
+            continue
+        x0, y0 = np.floor(np.min(landmarks[:, :2], axis=0)).astype(int)
+        x1, y1 = np.ceil(np.max(landmarks[:, :2], axis=0)).astype(int)
+        x0 = max(0, min(x0, width - 1))
+        y0 = max(0, min(y0, height - 1))
+        x1 = max(x0 + 1, min(x1, width))
+        y1 = max(y0 + 1, min(y1, height))
+
+        left_eye = _eye_from_landmarks(landmarks, LEFT_EYE, LEFT_IRIS)
+        right_eye = _eye_from_landmarks(landmarks, RIGHT_EYE, RIGHT_IRIS)
+        faces.append(
+            FaceRegion(
+                x=x0,
+                y=y0,
+                w=x1 - x0,
+                h=y1 - y0,
+                eyes=(left_eye, right_eye),
+                landmarks=landmarks,
+                detector="mediapipe-face-mesh",
+            )
+        )
+    return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
+
+
+def _eye_from_landmarks(
+    landmarks: np.ndarray,
+    eye_indices: tuple[int, ...],
+    iris_indices: tuple[int, ...],
+) -> tuple[float, float, float]:
+    center_indices = iris_indices if max(iris_indices) < landmarks.shape[0] else eye_indices
+    center_points = landmarks[list(center_indices)]
+    eye_points = landmarks[list(eye_indices)]
+    cx, cy = np.mean(center_points, axis=0)
+    width = float(np.max(eye_points[:, 0]) - np.min(eye_points[:, 0]))
+    height = float(np.max(eye_points[:, 1]) - np.min(eye_points[:, 1]))
+    return (float(cx), float(cy), max(width, height, 8.0) * 0.62)
 
 
 def _dedupe_face_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
@@ -361,18 +482,28 @@ def _build_skin_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> np.ndarray:
     region_mask = np.zeros((height, width), dtype=np.uint8)
     protect_mask = np.zeros((height, width), dtype=np.uint8)
     for face in faces:
-        center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.52))
-        axes = (round(face.w * 0.54), round(face.h * 0.62))
-        cv2.ellipse(region_mask, center, axes, 0, 0, 360, 255, -1)
+        if face.landmarks is not None:
+            _fill_landmark_polygon(region_mask, face, FACE_OVAL, 255)
+        else:
+            center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.52))
+            axes = (round(face.w * 0.54), round(face.h * 0.62))
+            cv2.ellipse(region_mask, center, axes, 0, 0, 360, 255, -1)
 
         neck_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 1.04))
         neck_axes = (round(face.w * 0.36), round(face.h * 0.30))
         cv2.ellipse(region_mask, neck_center, neck_axes, 0, 0, 360, 150, -1)
 
-        for cx, cy, radius in face.eyes:
-            cv2.circle(protect_mask, (round(cx), round(cy)), round(radius * 1.04), 255, -1)
-        mouth_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.73))
-        cv2.ellipse(protect_mask, mouth_center, (round(face.w * 0.20), round(face.h * 0.09)), 0, 0, 360, 255, -1)
+        if face.landmarks is not None:
+            _fill_landmark_polygon(protect_mask, face, LEFT_EYE, 255)
+            _fill_landmark_polygon(protect_mask, face, RIGHT_EYE, 255)
+            _fill_landmark_polygon(protect_mask, face, LEFT_BROW, 220)
+            _fill_landmark_polygon(protect_mask, face, RIGHT_BROW, 220)
+            _fill_landmark_polygon(protect_mask, face, LIPS, 255)
+        else:
+            for cx, cy, radius in face.eyes:
+                cv2.circle(protect_mask, (round(cx), round(cy)), round(radius * 1.04), 255, -1)
+            mouth_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.73))
+            cv2.ellipse(protect_mask, mouth_center, (round(face.w * 0.20), round(face.h * 0.09)), 0, 0, 360, 255, -1)
 
     ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
     skin_color = cv2.inRange(ycrcb, np.array([0, 132, 70], dtype=np.uint8), np.array([255, 180, 145], dtype=np.uint8))
@@ -405,8 +536,12 @@ def _build_segmentation_debug(
     debug = np.clip(base * (1.0 - alpha) + overlay_color * alpha, 0, 255).astype(np.uint8)
     if settings.pipeline == "quality":
         parts = _build_part_masks(rgb.shape[:2], faces)
+        debug = _debug_overlay_mask(debug, parts.face_skin, (255, 91, 151), 0.30)
         debug = _debug_overlay_mask(debug, parts.cheeks, (255, 150, 188), 0.42)
         debug = _debug_overlay_mask(debug, parts.lips, (230, 72, 118), 0.45)
+        debug = _debug_overlay_mask(debug, parts.eyes, (244, 198, 79), 0.45)
+        debug = _debug_overlay_mask(debug, parts.brows, (60, 70, 85), 0.42)
+        debug = _debug_overlay_mask(debug, parts.nose, (150, 210, 255), 0.36)
         debug = _debug_overlay_mask(debug, parts.hair, (80, 110, 130), 0.35)
 
     for index, face in enumerate(faces, start=1):
@@ -440,7 +575,10 @@ def _build_segmentation_debug(
 
 @dataclass(frozen=True)
 class PartMasks:
+    face_skin: np.ndarray
     eyes: np.ndarray
+    brows: np.ndarray
+    nose: np.ndarray
     cheeks: np.ndarray
     lips: np.ndarray
     hair: np.ndarray
@@ -449,36 +587,77 @@ class PartMasks:
 
 def _build_part_masks(shape: tuple[int, int], faces: list[FaceRegion]) -> PartMasks:
     height, width = shape
+    face_skin = np.zeros((height, width), dtype=np.uint8)
     eyes = np.zeros((height, width), dtype=np.uint8)
+    brows = np.zeros((height, width), dtype=np.uint8)
+    nose = np.zeros((height, width), dtype=np.uint8)
     cheeks = np.zeros((height, width), dtype=np.uint8)
     lips = np.zeros((height, width), dtype=np.uint8)
     hair = np.zeros((height, width), dtype=np.uint8)
     highlights = np.zeros((height, width), dtype=np.uint8)
 
     for face in faces:
-        for cx, cy, radius in face.eyes:
-            cv2.circle(eyes, (round(cx), round(cy)), round(radius * 1.18), 255, -1)
-            cv2.circle(highlights, (round(cx + radius * 0.22), round(cy - radius * 0.22)), max(2, round(radius * 0.18)), 210, -1)
+        if face.landmarks is not None:
+            _fill_landmark_polygon(face_skin, face, FACE_OVAL, 230)
+            _fill_landmark_polygon(eyes, face, LEFT_EYE, 255)
+            _fill_landmark_polygon(eyes, face, RIGHT_EYE, 255)
+            _fill_landmark_polygon(brows, face, LEFT_BROW, 220)
+            _fill_landmark_polygon(brows, face, RIGHT_BROW, 220)
+            _fill_landmark_polygon(nose, face, NOSE, 200)
+            _fill_landmark_polygon(lips, face, LIPS, 230)
+            _fill_landmark_polygon(cheeks, face, LEFT_CHEEK, 170)
+            _fill_landmark_polygon(cheeks, face, RIGHT_CHEEK, 170)
+            _fill_landmark_polyline(highlights, face, NOSE_BRIDGE, 160, width=max(2, round(face.w * 0.025)))
+            for cx, cy, radius in face.eyes:
+                cv2.circle(highlights, (round(cx + radius * 0.22), round(cy - radius * 0.22)), max(2, round(radius * 0.18)), 210, -1)
+            hair_top = max(0, round(face.y - face.h * 0.12))
+            hair_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.13))
+            hair_axes = (round(face.w * 0.55), round(face.h * 0.30))
+            cv2.ellipse(hair, hair_center, hair_axes, 0, 180, 360, 160, -1)
+            cv2.rectangle(hair, (face.x, hair_top), (face.x + face.w, round(face.y + face.h * 0.25)), 70, -1)
+        else:
+            for cx, cy, radius in face.eyes:
+                cv2.circle(eyes, (round(cx), round(cy)), round(radius * 1.18), 255, -1)
+                cv2.circle(highlights, (round(cx + radius * 0.22), round(cy - radius * 0.22)), max(2, round(radius * 0.18)), 210, -1)
 
-        cheek_y = round(face.y + face.h * 0.60)
-        cheek_axes = (round(face.w * 0.15), round(face.h * 0.075))
-        cv2.ellipse(cheeks, (round(face.x + face.w * 0.33), cheek_y), cheek_axes, -8, 0, 360, 190, -1)
-        cv2.ellipse(cheeks, (round(face.x + face.w * 0.67), cheek_y), cheek_axes, 8, 0, 360, 190, -1)
+            center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.52))
+            cv2.ellipse(face_skin, center, (round(face.w * 0.48), round(face.h * 0.55)), 0, 0, 360, 210, -1)
+            cheek_y = round(face.y + face.h * 0.60)
+            cheek_axes = (round(face.w * 0.15), round(face.h * 0.075))
+            cv2.ellipse(cheeks, (round(face.x + face.w * 0.33), cheek_y), cheek_axes, -8, 0, 360, 190, -1)
+            cv2.ellipse(cheeks, (round(face.x + face.w * 0.67), cheek_y), cheek_axes, 8, 0, 360, 190, -1)
 
-        mouth_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.73))
-        cv2.ellipse(lips, mouth_center, (round(face.w * 0.18), round(face.h * 0.065)), 0, 0, 360, 210, -1)
+            mouth_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.73))
+            cv2.ellipse(lips, mouth_center, (round(face.w * 0.18), round(face.h * 0.065)), 0, 0, 360, 210, -1)
 
-        hair_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.16))
-        hair_axes = (round(face.w * 0.50), round(face.h * 0.28))
-        cv2.ellipse(hair, hair_center, hair_axes, 0, 180, 360, 160, -1)
+            hair_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.16))
+            hair_axes = (round(face.w * 0.50), round(face.h * 0.28))
+            cv2.ellipse(hair, hair_center, hair_axes, 0, 180, 360, 160, -1)
 
     return PartMasks(
+        face_skin=cv2.GaussianBlur(face_skin, (0, 0), sigmaX=5.0),
         eyes=cv2.GaussianBlur(eyes, (0, 0), sigmaX=3.0),
+        brows=cv2.GaussianBlur(brows, (0, 0), sigmaX=2.0),
+        nose=cv2.GaussianBlur(nose, (0, 0), sigmaX=3.0),
         cheeks=cv2.GaussianBlur(cheeks, (0, 0), sigmaX=10.0),
         lips=cv2.GaussianBlur(lips, (0, 0), sigmaX=2.8),
         hair=cv2.GaussianBlur(hair, (0, 0), sigmaX=8.0),
         highlights=cv2.GaussianBlur(highlights, (0, 0), sigmaX=2.0),
     )
+
+
+def _fill_landmark_polygon(mask: np.ndarray, face: FaceRegion, indices: tuple[int, ...], value: int) -> None:
+    if face.landmarks is None or max(indices) >= face.landmarks.shape[0]:
+        return
+    points = np.round(face.landmarks[list(indices)]).astype(np.int32)
+    cv2.fillPoly(mask, [points], value)
+
+
+def _fill_landmark_polyline(mask: np.ndarray, face: FaceRegion, indices: tuple[int, ...], value: int, width: int) -> None:
+    if face.landmarks is None or max(indices) >= face.landmarks.shape[0]:
+        return
+    points = np.round(face.landmarks[list(indices)]).astype(np.int32)
+    cv2.polylines(mask, [points], isClosed=False, color=value, thickness=width, lineType=cv2.LINE_AA)
 
 
 def _apply_local_beauty_layers(
@@ -623,6 +802,14 @@ def _accelerator_name() -> str:
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return "torch-mps"
     return "opencv-cpu"
+
+
+def _segmenter_name(faces: list[FaceRegion]) -> str:
+    if any(face.detector == "mediapipe-face-mesh" for face in faces):
+        return "mediapipe-face-mesh"
+    if faces:
+        return "opencv-haar-fallback"
+    return "fallback-soft-mask"
 
 
 def _apply_mps_color_preset(

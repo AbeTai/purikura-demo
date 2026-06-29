@@ -5,7 +5,17 @@ import io
 import numpy as np
 from PIL import Image, ImageDraw
 
-from purikura_demo.processing import FaceRegion, PurikuraSettings, _build_skin_mask, apply_purikura_effect
+from purikura_demo.processing import (
+    FACE_OVAL,
+    LEFT_EYE,
+    LIPS,
+    NOSE,
+    FaceRegion,
+    PurikuraSettings,
+    _build_part_masks,
+    _build_skin_mask,
+    apply_purikura_effect,
+)
 
 
 def test_apply_purikura_effect_returns_jpeg() -> None:
@@ -39,6 +49,7 @@ def test_strong_effect_mode_is_reported() -> None:
     assert result.metrics["mode"] == "max"
     assert result.metrics["pipeline"] == "quality"
     assert result.metrics["accelerator"] in {"opencv-cpu", "torch-mps"}
+    assert result.metrics["segmenter"] in {"mediapipe-face-mesh", "opencv-haar-fallback", "fallback-soft-mask"}
 
 
 def test_skin_mask_combines_multiple_faces() -> None:
@@ -55,6 +66,22 @@ def test_skin_mask_combines_multiple_faces() -> None:
     assert mask[155, 455] > 0
 
 
+def test_part_masks_use_landmark_polygons() -> None:
+    landmarks = np.zeros((478, 2), dtype=np.float32)
+    _assign_polygon(landmarks, FACE_OVAL, [(120, 80), (260, 80), (280, 210), (190, 300), (100, 210)])
+    _assign_polygon(landmarks, LEFT_EYE, [(205, 145), (235, 145), (240, 162), (220, 172), (200, 162)])
+    _assign_polygon(landmarks, NOSE, [(185, 165), (205, 170), (215, 225), (175, 225)])
+    _assign_polygon(landmarks, LIPS, [(160, 245), (220, 245), (235, 265), (190, 280), (145, 265)])
+    face = FaceRegion(100, 80, 180, 220, ((220.0, 158.0, 20.0), (160.0, 158.0, 20.0)), landmarks, "mediapipe-face-mesh")
+
+    masks = _build_part_masks((360, 420), [face])
+
+    assert masks.face_skin[190, 190] > 0
+    assert masks.eyes[158, 220] > 0
+    assert masks.nose.max() > 0
+    assert masks.lips.max() > 0
+
+
 def _sample_face_image() -> bytes:
     image = Image.new("RGB", (420, 560), (238, 226, 222))
     draw = ImageDraw.Draw(image)
@@ -66,3 +93,8 @@ def _sample_face_image() -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def _assign_polygon(landmarks: np.ndarray, indices: tuple[int, ...], points: list[tuple[int, int]]) -> None:
+    for offset, index in enumerate(indices):
+        landmarks[index] = points[offset % len(points)]

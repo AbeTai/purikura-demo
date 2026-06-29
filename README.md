@@ -8,7 +8,8 @@
 
 - FastAPI による画像アップロード API
 - htmx による結果部分の非同期差し替え
-- OpenCV Haar cascade による複数人の顔・目の簡易検出
+- MediaPipe Face Mesh による複数人の顔・目・眉・鼻・唇・頬の細かいパーツ推定
+- MediaPipe が使えない場合の OpenCV Haar fallback
 - 境界フェザーつき逆写像ワープによる目拡大
 - 境界で自然に戻る楕円 ROI の簡易小顔ワープ
 - 顔・首周辺のソフトマスクつき bilateral / Gaussian blend
@@ -17,7 +18,7 @@
 - 周波数分離、局所メイク、髪のなめらか化を含む `Quality` パイプライン
 - `Natural / Strong / Max` の加工強度モード
 - 元画像と加工後画像の比較表示
-- 顔 bbox、目領域、肌マスクを重ねたセグメンテーションデバッグ表示
+- 顔 bbox、目、眉、鼻、唇、頬、肌、髪近似マスクを重ねたセグメンテーションデバッグ表示
 - PyTorch MPS が利用可能な環境では一部の色調処理を `torch-mps` で実行
 
 ## Setup
@@ -45,4 +46,4 @@ uv run pytest
 - `Quality`: 静止画向けの高品質処理です。周波数分離で肌の低周波だけを整え、目元シャープ、キャッチライト、チーク、リップ、髪の軽いなめらか化、肌トーン補正を局所マスクで重ねます。
 - `Classic`: 以前の軽量寄り処理です。比較や高速確認用に残しています。
 
-PyTorch がインストールされ、Apple Silicon の MPS が使える場合は、`Quality` の色調処理の一部が自動で MPS に切り替わります。未インストールまたは MPS 非対応の場合は OpenCV/NumPy CPU で動きます。
+PyTorch がインストールされ、Apple Silicon の MPS が使える場合は、`Quality` の色調処理の一部が自動で MPS に切り替わります。MPS 非対応の場合は OpenCV/NumPy CPU で動きます。顔パーツ推定は MediaPipe Face Mesh を優先し、失敗時だけ OpenCV Haar にフォールバックします。
