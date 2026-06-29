@@ -44,10 +44,11 @@ def test_unknown_preset_falls_back_to_strawberry() -> None:
 
 def test_strong_effect_mode_is_reported() -> None:
     source = _sample_face_image()
-    result = apply_purikura_effect(source, PurikuraSettings(effect_mode="max", eye_enlarge=1.0, face_slim=1.0))
+    result = apply_purikura_effect(source, PurikuraSettings(effect_mode="ultra", eye_enlarge=1.0, face_slim=1.0))
 
-    assert result.metrics["mode"] == "max"
+    assert result.metrics["mode"] == "ultra"
     assert result.metrics["pipeline"] == "quality"
+    assert result.metrics["preset"] == "sample_match"
     assert result.metrics["accelerator"] in {"opencv-cpu", "torch-mps"}
     assert result.metrics["segmenter"] in {"mediapipe-face-mesh", "opencv-haar-fallback", "fallback-soft-mask"}
 
@@ -80,6 +81,15 @@ def test_part_masks_use_landmark_polygons() -> None:
     assert masks.eyes[158, 220] > 0
     assert masks.nose.max() > 0
     assert masks.lips.max() > 0
+
+
+def test_fallback_part_masks_include_side_hair() -> None:
+    face = FaceRegion(100, 80, 180, 220, ((220.0, 158.0, 20.0), (160.0, 158.0, 20.0)))
+
+    masks = _build_part_masks((420, 420), [face])
+
+    assert masks.hair[260, 115] > 0
+    assert masks.hair[260, 265] > 0
 
 
 def _sample_face_image() -> bytes:

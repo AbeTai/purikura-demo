@@ -82,7 +82,7 @@
           </div>
 
           <label class="toggle">
-            <input name="decorations" type="checkbox" value="true" checked />
+            <input name="decorations" type="checkbox" value="true" {% if settings.decorations %}checked{% endif %} />
             <span>Frame</span>
           </label>
 

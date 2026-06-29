@@ -36,14 +36,14 @@ async def index(request: Request) -> HTMLResponse:
 async def process_image(
     request: Request,
     image: UploadFile = File(...),
-    preset: str = Form("strawberry"),
+    preset: str = Form(PurikuraSettings.preset),
     pipeline: str = Form("quality"),
-    effect_mode: str = Form("normal"),
-    purikura_intensity: float = Form(0.78),
-    skin_smoothing: float = Form(0.72),
-    eye_enlarge: float = Form(0.55),
-    face_slim: float = Form(0.42),
-    glow: float = Form(0.55),
+    effect_mode: str = Form(PurikuraSettings.effect_mode),
+    purikura_intensity: float = Form(PurikuraSettings.purikura_intensity),
+    skin_smoothing: float = Form(PurikuraSettings.skin_smoothing),
+    eye_enlarge: float = Form(PurikuraSettings.eye_enlarge),
+    face_slim: float = Form(PurikuraSettings.face_slim),
+    glow: float = Form(PurikuraSettings.glow),
     decorations: bool = Form(False),
 ) -> HTMLResponse:
     if not image.content_type or not image.content_type.startswith("image/"):

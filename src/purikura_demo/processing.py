@@ -63,19 +63,20 @@ RIGHT_IRIS = (469, 470, 471, 472)
 
 @dataclass(frozen=True)
 class PurikuraSettings:
-    preset: str = "strawberry"
+    preset: str = "sample_match"
     pipeline: str = "quality"
-    effect_mode: str = "normal"
-    purikura_intensity: float = 0.78
-    skin_smoothing: float = 0.72
-    eye_enlarge: float = 0.55
-    face_slim: float = 0.42
-    glow: float = 0.55
-    decorations: bool = True
+    effect_mode: str = "ultra"
+    purikura_intensity: float = 0.92
+    skin_smoothing: float = 0.86
+    eye_enlarge: float = 1.0
+    face_slim: float = 0.58
+    glow: float = 0.42
+    decorations: bool = False
 
     @staticmethod
     def available_presets() -> tuple[tuple[str, str], ...]:
         return (
+            ("sample_match", "サンプル寄せ"),
             ("strawberry", "いちごミルク"),
             ("natural", "ナチュラル盛れ"),
             ("cool", "透明感クール"),
@@ -89,6 +90,7 @@ class PurikuraSettings:
             ("normal", "Natural"),
             ("strong", "Strong"),
             ("max", "Max"),
+            ("ultra", "Ultra"),
         )
 
     @staticmethod
@@ -211,7 +213,7 @@ def _clamp_settings(settings: PurikuraSettings) -> PurikuraSettings:
 
 
 def _mode_multiplier(settings: PurikuraSettings) -> float:
-    return {"normal": 1.0, "strong": 1.32, "max": 1.68}[settings.effect_mode]
+    return {"normal": 1.0, "strong": 1.32, "max": 1.68, "ultra": 2.06}[settings.effect_mode]
 
 
 def _effective_strength(value: float, settings: PurikuraSettings, cap: float = 1.0) -> float:
@@ -380,12 +382,14 @@ def _apply_geometry_warp(rgb: np.ndarray, faces: list[FaceRegion], settings: Pur
             _add_face_slim_map(map_x, face, _effective_strength(settings.face_slim, settings, cap=1.25))
         if settings.eye_enlarge > 0:
             for cx, cy, radius in face.eyes:
+                eye_cap = 2.18 if settings.preset == "sample_match" else 1.35
+                eye_radius = radius * (1.76 if settings.preset == "sample_match" else 1.28)
                 _add_eye_enlarge_map(
                     map_x,
                     map_y,
                     (cx, cy),
-                    radius * (1.28 + 0.10 * (_mode_multiplier(settings) - 1.0)),
-                    _effective_strength(settings.eye_enlarge, settings, cap=1.35),
+                    eye_radius * (1.0 + 0.10 * (_mode_multiplier(settings) - 1.0)),
+                    _effective_strength(settings.eye_enlarge, settings, cap=eye_cap),
                 )
 
     return cv2.remap(rgb, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
@@ -517,6 +521,11 @@ def _build_skin_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> np.ndarray:
 
     protect = cv2.GaussianBlur(protect_mask, (0, 0), sigmaX=4.0).astype(np.float32) / 255.0
     mask *= 1.0 - protect * 0.82
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    dark_detail = cv2.inRange(hsv, np.array([0, 0, 0], dtype=np.uint8), np.array([180, 190, 126], dtype=np.uint8))
+    dark_detail = cv2.GaussianBlur(dark_detail, (0, 0), sigmaX=5.0).astype(np.float32) / 255.0
+    mask *= 1.0 - dark_detail * 0.30
     return np.clip(mask * 255.0, 0, 255).astype(np.uint8)
 
 
@@ -610,11 +619,25 @@ def _build_part_masks(shape: tuple[int, int], faces: list[FaceRegion]) -> PartMa
             _fill_landmark_polyline(highlights, face, NOSE_BRIDGE, 160, width=max(2, round(face.w * 0.025)))
             for cx, cy, radius in face.eyes:
                 cv2.circle(highlights, (round(cx + radius * 0.22), round(cy - radius * 0.22)), max(2, round(radius * 0.18)), 210, -1)
-            hair_top = max(0, round(face.y - face.h * 0.12))
+            hair_top = max(0, round(face.y - face.h * 0.16))
             hair_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.13))
             hair_axes = (round(face.w * 0.55), round(face.h * 0.30))
             cv2.ellipse(hair, hair_center, hair_axes, 0, 180, 360, 160, -1)
-            cv2.rectangle(hair, (face.x, hair_top), (face.x + face.w, round(face.y + face.h * 0.25)), 70, -1)
+            cv2.ellipse(
+                hair,
+                (round(face.x + face.w * 0.5), round(face.y + face.h * 0.44)),
+                (round(face.w * 0.68), round(face.h * 0.72)),
+                0,
+                0,
+                360,
+                90,
+                -1,
+            )
+            cv2.rectangle(hair, (face.x, hair_top), (face.x + face.w, round(face.y + face.h * 0.30)), 90, -1)
+            side_y = round(face.y + face.h * 0.78)
+            side_axes = (round(face.w * 0.24), round(face.h * 0.76))
+            cv2.ellipse(hair, (round(face.x + face.w * 0.10), side_y), side_axes, -6, 0, 360, 78, -1)
+            cv2.ellipse(hair, (round(face.x + face.w * 0.90), side_y), side_axes, 6, 0, 360, 78, -1)
         else:
             for cx, cy, radius in face.eyes:
                 cv2.circle(eyes, (round(cx), round(cy)), round(radius * 1.18), 255, -1)
@@ -633,6 +656,20 @@ def _build_part_masks(shape: tuple[int, int], faces: list[FaceRegion]) -> PartMa
             hair_center = (round(face.x + face.w * 0.5), round(face.y + face.h * 0.16))
             hair_axes = (round(face.w * 0.50), round(face.h * 0.28))
             cv2.ellipse(hair, hair_center, hair_axes, 0, 180, 360, 160, -1)
+            cv2.ellipse(
+                hair,
+                (round(face.x + face.w * 0.5), round(face.y + face.h * 0.45)),
+                (round(face.w * 0.66), round(face.h * 0.72)),
+                0,
+                0,
+                360,
+                92,
+                -1,
+            )
+            side_y = round(face.y + face.h * 0.82)
+            side_axes = (round(face.w * 0.25), round(face.h * 0.82))
+            cv2.ellipse(hair, (round(face.x + face.w * 0.08), side_y), side_axes, -8, 0, 360, 82, -1)
+            cv2.ellipse(hair, (round(face.x + face.w * 0.92), side_y), side_axes, 8, 0, 360, 82, -1)
 
     return PartMasks(
         face_skin=cv2.GaussianBlur(face_skin, (0, 0), sigmaX=5.0),
@@ -673,7 +710,10 @@ def _apply_local_beauty_layers(
     parts = _build_part_masks(rgb.shape[:2], faces)
     out = rgb.astype(np.float32)
 
-    out = _blend_with_mask(out, _unsharp(rgb, sigma=1.0, amount=0.75 + 0.18 * strength), parts.eyes, 0.62)
+    eye_detail = _unsharp(rgb, sigma=1.0, amount=0.75 + 0.18 * strength)
+    if settings.preset == "sample_match":
+        eye_detail = _sample_match_eye_detail(eye_detail)
+    out = _blend_with_mask(out, eye_detail, parts.eyes, 0.70 if settings.preset == "sample_match" else 0.62)
     out = _screen_with_mask(out, np.full_like(rgb, (255, 245, 252), dtype=np.uint8), parts.highlights, 0.55)
 
     cheek_color = np.full_like(rgb, (255, 120, 170), dtype=np.uint8)
@@ -681,32 +721,75 @@ def _apply_local_beauty_layers(
     out = _soft_light_with_mask(out, cheek_color, parts.cheeks, 0.20 + 0.08 * strength)
     out = _soft_light_with_mask(out, lip_color, parts.lips, 0.34 + 0.10 * strength)
 
-    hair_mask = _refine_hair_mask(rgb, parts.hair, skin_mask)
+    hair_mask = _refine_hair_mask(rgb, parts.hair, skin_mask, settings)
     if hair_mask.max() > 0:
         hair_smooth = cv2.bilateralFilter(rgb, d=7, sigmaColor=32, sigmaSpace=7)
         hair_gloss = cv2.addWeighted(hair_smooth, 1.08, cv2.GaussianBlur(hair_smooth, (0, 0), 4.0), -0.08, 0)
         out = _blend_with_mask(out, hair_gloss, hair_mask, 0.32)
+        if settings.preset == "sample_match":
+            brown_hair = _sample_match_hair_tone(np.clip(out, 0, 255).astype(np.uint8))
+            out = _blend_with_mask(out, brown_hair, hair_mask, 0.68)
 
     skin_tone = _skin_tone_lift(np.clip(out, 0, 255).astype(np.uint8), settings)
-    out = _blend_with_mask(out, skin_tone, skin_mask, 0.42)
+    out = _blend_with_mask(out, skin_tone, skin_mask, 0.28 if settings.preset == "sample_match" else 0.42)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _refine_hair_mask(rgb: np.ndarray, rough_hair: np.ndarray, skin_mask: np.ndarray) -> np.ndarray:
+def _refine_hair_mask(
+    rgb: np.ndarray,
+    rough_hair: np.ndarray,
+    skin_mask: np.ndarray,
+    settings: PurikuraSettings | None = None,
+) -> np.ndarray:
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    dark = cv2.inRange(hsv, np.array([0, 0, 0], dtype=np.uint8), np.array([180, 120, 105], dtype=np.uint8))
+    sample_match = settings is not None and settings.preset == "sample_match"
+    max_saturation = 172 if sample_match else 120
+    max_value = 150 if sample_match else 105
+    dark = cv2.inRange(
+        hsv,
+        np.array([0, 0, 0], dtype=np.uint8),
+        np.array([180, max_saturation, max_value], dtype=np.uint8),
+    )
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8), iterations=1)
     mask = (rough_hair.astype(np.float32) / 255.0) * (dark.astype(np.float32) / 255.0)
-    mask *= 1.0 - (skin_mask.astype(np.float32) / 255.0) * 0.55
-    return np.clip(cv2.GaussianBlur(mask, (0, 0), sigmaX=5.0) * 255.0, 0, 255).astype(np.uint8)
+    skin_suppression = 0.28 if sample_match else 0.55
+    mask *= 1.0 - (skin_mask.astype(np.float32) / 255.0) * skin_suppression
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=7.0 if sample_match else 5.0)
+    return np.clip(mask * 255.0, 0, 255).astype(np.uint8)
 
 
 def _skin_tone_lift(rgb: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
     strength = _effective_strength(settings.skin_smoothing, settings, cap=1.25)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    lab[:, :, 0] += 4.0 + 5.0 * strength
-    lab[:, :, 1] += 0.7 + 1.0 * strength
-    lab[:, :, 2] -= 0.6 + 1.5 * strength
+    if settings.preset == "sample_match":
+        lab[:, :, 0] += 1.2 + 1.9 * strength
+        lab[:, :, 1] += 1.0 + 0.6 * strength
+        lab[:, :, 2] -= 2.2 + 2.4 * strength
+    else:
+        lab[:, :, 0] += 4.0 + 5.0 * strength
+        lab[:, :, 1] += 0.7 + 1.0 * strength
+        lab[:, :, 2] -= 0.6 + 1.5 * strength
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+
+def _sample_match_hair_tone(rgb: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[:, :, 0] += 28.0
+    lab[:, :, 1] += 5.6
+    lab[:, :, 2] += 8.0
+    toned = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    brown = np.full_like(rgb, (170, 127, 104), dtype=np.uint8)
+    return _soft_light_with_mask(toned.astype(np.float32), brown, np.full(rgb.shape[:2], 220, dtype=np.uint8), 0.62).astype(np.uint8)
+
+
+def _sample_match_eye_detail(rgb: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[:, :, 0] -= 7.0
+    lab[:, :, 1] += 1.6
+    lab[:, :, 2] -= 0.8
+    contrasted = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    crisp = cv2.addWeighted(contrasted, 1.16, cv2.GaussianBlur(contrasted, (0, 0), 0.9), -0.16, 0)
+    return np.clip(crisp, 0, 255).astype(np.uint8)
 
 
 def _unsharp(rgb: np.ndarray, sigma: float, amount: float) -> np.ndarray:
@@ -749,6 +832,9 @@ def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:
 
 def _apply_color_preset(rgb: np.ndarray, skin_mask: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
     intensity = _effective_strength(settings.purikura_intensity, settings, cap=1.35)
+    if settings.preset == "sample_match":
+        return _apply_sample_match_color(rgb, skin_mask, settings, intensity)
+
     mps_result = _apply_mps_color_preset(rgb, skin_mask, settings, intensity)
     if mps_result is not None:
         return mps_result
@@ -792,6 +878,33 @@ def _apply_color_preset(rgb: np.ndarray, skin_mask: np.ndarray, settings: Puriku
     if settings.preset == "film":
         gamma = 1.04
     return _apply_gamma(mixed, gamma)
+
+
+def _apply_sample_match_color(
+    rgb: np.ndarray,
+    skin_mask: np.ndarray,
+    settings: PurikuraSettings,
+    intensity: float,
+) -> np.ndarray:
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[:, :, 0] = 128.0 + (lab[:, :, 0] - 128.0) * 0.88 + 11.2 * intensity
+    lab[:, :, 1] = 128.0 + (lab[:, :, 1] - 128.0) * 0.88 + 2.2 * intensity
+    lab[:, :, 2] = 128.0 + (lab[:, :, 2] - 128.0) * 0.72 - 0.8 * intensity
+    matched = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+    hsv = cv2.cvtColor(matched, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv[:, :, 1] *= 0.82
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.025 + 2.0, 0, 255)
+    matched = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    skin = skin_mask.astype(np.float32) / 255.0
+    skin_lab = cv2.cvtColor(matched, cv2.COLOR_RGB2LAB).astype(np.float32)
+    skin_lab[:, :, 0] += skin * (2.8 + 1.2 * intensity)
+    skin_lab[:, :, 1] += skin * 1.6
+    skin_lab[:, :, 2] -= skin * 0.6
+    matched = cv2.cvtColor(np.clip(skin_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+    return _apply_gamma(matched, 0.985)
 
 
 def _accelerator_name() -> str:
