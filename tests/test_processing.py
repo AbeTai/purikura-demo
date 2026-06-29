@@ -12,8 +12,11 @@ from purikura_demo.processing import (
     NOSE,
     FaceRegion,
     PurikuraSettings,
+    build_feathered_region,
     _build_part_masks,
     _build_skin_mask,
+    _refine_hair_mask,
+    suppress_mask_on_edges,
     apply_purikura_effect,
 )
 
@@ -90,6 +93,41 @@ def test_fallback_part_masks_include_side_hair() -> None:
 
     assert masks.hair[260, 115] > 0
     assert masks.hair[260, 265] > 0
+
+
+def test_feathered_region_has_core_and_transition() -> None:
+    mask = np.zeros((120, 120), dtype=np.uint8)
+    mask[30:90, 30:90] = 255
+
+    region = build_feathered_region(mask, inner_px=12, outer_px=30)
+
+    assert region.core[60, 60] > 0.9
+    assert 0.0 < region.transition[31, 60] < region.core[60, 60]
+    assert region.alpha[29, 60] > 0.0
+    assert region.alpha[5, 5] == 0.0
+
+
+def test_edge_suppression_reduces_mask_on_strong_edges() -> None:
+    rgb = np.full((80, 80, 3), 230, dtype=np.uint8)
+    rgb[:, 40:] = 25
+    mask = np.full((80, 80), 255, dtype=np.uint8)
+
+    suppressed = suppress_mask_on_edges(mask, rgb)
+
+    assert suppressed[40, 40] < suppressed[40, 20]
+
+
+def test_hair_refinement_keeps_dark_hair_over_skin_overlap() -> None:
+    rgb = np.full((160, 160, 3), (226, 190, 172), dtype=np.uint8)
+    rgb[20:130, 25:70] = (40, 30, 28)
+    rough_hair = np.zeros((160, 160), dtype=np.uint8)
+    rough_hair[15:135, 20:76] = 180
+    skin_mask = np.zeros((160, 160), dtype=np.uint8)
+    skin_mask[30:135, 45:120] = 220
+
+    hair = _refine_hair_mask(rgb, rough_hair, skin_mask, PurikuraSettings())
+
+    assert hair[70, 50] > 0
 
 
 def _sample_face_image() -> bytes:

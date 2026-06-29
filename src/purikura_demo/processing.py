@@ -110,6 +110,13 @@ class ProcessedImage:
 
 
 @dataclass(frozen=True)
+class FeatheredRegion:
+    alpha: np.ndarray
+    core: np.ndarray
+    transition: np.ndarray
+
+
+@dataclass(frozen=True)
 class FaceRegion:
     x: int
     y: int
@@ -376,23 +383,39 @@ def _apply_geometry_warp(rgb: np.ndarray, faces: list[FaceRegion], settings: Pur
     grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
     map_x = grid_x.copy()
     map_y = grid_y.copy()
+    support = np.zeros((height, width), dtype=np.uint8)
 
     for face in faces:
         if settings.face_slim > 0:
             _add_face_slim_map(map_x, face, _effective_strength(settings.face_slim, settings, cap=1.25))
+            cv2.ellipse(
+                support,
+                (round(face.center[0]), round(face.center[1] + face.h * 0.20)),
+                (round(face.w * 0.64), round(face.h * 0.70)),
+                0,
+                0,
+                360,
+                255,
+                -1,
+            )
         if settings.eye_enlarge > 0:
             for cx, cy, radius in face.eyes:
                 eye_cap = 2.18 if settings.preset == "sample_match" else 1.35
                 eye_radius = radius * (1.76 if settings.preset == "sample_match" else 1.28)
+                support_radius = eye_radius * (1.0 + 0.10 * (_mode_multiplier(settings) - 1.0))
+                cv2.circle(support, (round(cx), round(cy)), round(support_radius), 255, -1)
                 _add_eye_enlarge_map(
                     map_x,
                     map_y,
                     (cx, cy),
-                    eye_radius * (1.0 + 0.10 * (_mode_multiplier(settings) - 1.0)),
+                    support_radius,
                     _effective_strength(settings.eye_enlarge, settings, cap=eye_cap),
                 )
 
-    return cv2.remap(rgb, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+    warped = cv2.remap(rgb, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+    if support.max() == 0:
+        return warped
+    return _repair_warp_boundary(rgb, warped, support)
 
 
 def _add_eye_enlarge_map(
@@ -450,11 +473,21 @@ def _add_face_slim_map(map_x: np.ndarray, face: FaceRegion, strength: float) -> 
     region_x[mask] = cx + dx[mask] / scale[mask]
 
 
+def _repair_warp_boundary(original: np.ndarray, warped: np.ndarray, support_mask: np.ndarray) -> np.ndarray:
+    region = build_feathered_region(support_mask, inner_px=14, outer_px=46)
+    if region.transition.max() <= 0:
+        return warped
+    matched = match_boundary_tone(original, warped, region.transition)
+    repaired = _blend_with_float_mask(warped.astype(np.float32), matched, region.transition, 0.42)
+    return np.clip(repaired, 0, 255).astype(np.uint8)
+
+
 def _apply_skin_retouch(rgb: np.ndarray, mask: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
     if settings.skin_smoothing <= 0:
         return rgb
 
     strength = _effective_strength(settings.skin_smoothing, settings, cap=1.35)
+    safe_mask = suppress_mask_on_edges(mask, rgb)
     if settings.pipeline == "quality":
         retouch = _frequency_separated_skin(rgb, strength)
     else:
@@ -464,8 +497,12 @@ def _apply_skin_retouch(rgb: np.ndarray, mask: np.ndarray, settings: PurikuraSet
         detail = cv2.addWeighted(rgb, 1.15, broader, -0.15, 0)
         retouch = cv2.addWeighted(smoothed, 0.88, detail, 0.12, 0)
 
-    alpha = (mask.astype(np.float32) / 255.0)[:, :, None] * min(0.92, 0.26 + 0.52 * strength)
-    return np.clip(rgb.astype(np.float32) * (1.0 - alpha) + retouch.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+    region = build_feathered_region(safe_mask, inner_px=18, outer_px=64)
+    base_opacity = min(0.92, 0.26 + 0.52 * strength)
+    boundary_matched = match_boundary_tone(rgb, retouch, region.transition)
+    retouch = _blend_with_float_mask(retouch.astype(np.float32), boundary_matched, region.transition, 1.0)
+    alpha = np.clip(region.core * base_opacity + region.transition * base_opacity * 0.38, 0.0, 1.0)
+    return np.clip(rgb.astype(np.float32) * (1.0 - alpha[:, :, None]) + retouch * alpha[:, :, None], 0, 255).astype(np.uint8)
 
 
 def _frequency_separated_skin(rgb: np.ndarray, strength: float) -> np.ndarray:
@@ -545,13 +582,29 @@ def _build_segmentation_debug(
     debug = np.clip(base * (1.0 - alpha) + overlay_color * alpha, 0, 255).astype(np.uint8)
     if settings.pipeline == "quality":
         parts = _build_part_masks(rgb.shape[:2], faces)
-        debug = _debug_overlay_mask(debug, parts.face_skin, (255, 91, 151), 0.30)
-        debug = _debug_overlay_mask(debug, parts.cheeks, (255, 150, 188), 0.42)
+        skin_region = build_feathered_region(suppress_mask_on_edges(skin_mask, rgb), inner_px=18, outer_px=64)
+        eyes_region = build_feathered_region(parts.eyes, inner_px=5, outer_px=22)
+        brows_region = build_feathered_region(parts.brows, inner_px=4, outer_px=18)
+        lips_region = build_feathered_region(parts.lips, inner_px=5, outer_px=24)
+        protected = np.maximum.reduce((eyes_region.alpha, brows_region.alpha * 0.85, lips_region.alpha))
+        debug = _debug_overlay_float_mask(debug, skin_region.transition, (255, 184, 84), 0.42)
+        debug = _debug_overlay_float_mask(debug, skin_region.core, (255, 91, 151), 0.36)
+        debug = _debug_overlay_mask(debug, parts.cheeks, (255, 150, 188), 0.34)
         debug = _debug_overlay_mask(debug, parts.lips, (230, 72, 118), 0.45)
         debug = _debug_overlay_mask(debug, parts.eyes, (244, 198, 79), 0.45)
-        debug = _debug_overlay_mask(debug, parts.brows, (60, 70, 85), 0.42)
+        debug = _debug_overlay_float_mask(debug, protected, (87, 95, 112), 0.28)
         debug = _debug_overlay_mask(debug, parts.nose, (150, 210, 255), 0.36)
         debug = _debug_overlay_mask(debug, parts.hair, (80, 110, 130), 0.35)
+        cv2.putText(
+            debug,
+            "skin core / transition / protected parts",
+            (24, min(debug.shape[0] - 24, 40)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (30, 30, 30),
+            2,
+            cv2.LINE_AA,
+        )
 
     for index, face in enumerate(faces, start=1):
         cv2.rectangle(debug, (face.x, face.y), (face.x + face.w, face.y + face.h), (21, 168, 143), 3)
@@ -710,28 +763,44 @@ def _apply_local_beauty_layers(
     parts = _build_part_masks(rgb.shape[:2], faces)
     out = rgb.astype(np.float32)
 
+    eyes_region = build_feathered_region(parts.eyes, inner_px=5, outer_px=22)
+    brows_region = build_feathered_region(parts.brows, inner_px=4, outer_px=18)
+    lips_region = build_feathered_region(parts.lips, inner_px=5, outer_px=24)
+    cheeks_region = build_feathered_region(parts.cheeks, inner_px=12, outer_px=42)
+    protect = np.maximum.reduce((eyes_region.alpha, brows_region.alpha * 0.85, lips_region.alpha))
+
     eye_detail = _unsharp(rgb, sigma=1.0, amount=0.75 + 0.18 * strength)
     if settings.preset == "sample_match":
         eye_detail = _sample_match_eye_detail(eye_detail)
-    out = _blend_with_mask(out, eye_detail, parts.eyes, 0.70 if settings.preset == "sample_match" else 0.62)
-    out = _screen_with_mask(out, np.full_like(rgb, (255, 245, 252), dtype=np.uint8), parts.highlights, 0.55)
+    eye_detail = match_boundary_tone(rgb, eye_detail, eyes_region.transition)
+    out = _blend_with_float_mask(out, eye_detail, eyes_region.alpha, 0.70 if settings.preset == "sample_match" else 0.62)
+    highlight_region = build_feathered_region(parts.highlights, inner_px=2, outer_px=10)
+    out = _screen_with_float_mask(out, np.full_like(rgb, (255, 245, 252), dtype=np.uint8), highlight_region.alpha, 0.55)
 
     cheek_color = np.full_like(rgb, (255, 120, 170), dtype=np.uint8)
     lip_color = np.full_like(rgb, (218, 72, 118), dtype=np.uint8)
-    out = _soft_light_with_mask(out, cheek_color, parts.cheeks, 0.20 + 0.08 * strength)
-    out = _soft_light_with_mask(out, lip_color, parts.lips, 0.34 + 0.10 * strength)
+    cheek_alpha = cheeks_region.alpha * (1.0 - protect * 0.80)
+    out = _soft_light_with_float_mask(out, cheek_color, cheek_alpha, 0.20 + 0.08 * strength)
+    lip_layer = match_boundary_tone(np.clip(out, 0, 255).astype(np.uint8), lip_color, lips_region.transition)
+    out = _soft_light_with_float_mask(out, lip_layer, lips_region.alpha, 0.34 + 0.10 * strength)
 
     hair_mask = _refine_hair_mask(rgb, parts.hair, skin_mask, settings)
+    hair_region = build_feathered_region(hair_mask, inner_px=10, outer_px=44)
     if hair_mask.max() > 0:
         hair_smooth = cv2.bilateralFilter(rgb, d=7, sigmaColor=32, sigmaSpace=7)
         hair_gloss = cv2.addWeighted(hair_smooth, 1.08, cv2.GaussianBlur(hair_smooth, (0, 0), 4.0), -0.08, 0)
-        out = _blend_with_mask(out, hair_gloss, hair_mask, 0.32)
+        hair_gloss = match_boundary_tone(rgb, hair_gloss, hair_region.transition)
+        out = _blend_with_float_mask(out, hair_gloss, hair_region.alpha, 0.32)
         if settings.preset == "sample_match":
             brown_hair = _sample_match_hair_tone(np.clip(out, 0, 255).astype(np.uint8))
-            out = _blend_with_mask(out, brown_hair, hair_mask, 0.68)
+            brown_hair = match_boundary_tone(rgb, brown_hair, hair_region.transition)
+            out = _blend_with_float_mask(out, brown_hair, hair_region.alpha, 0.68)
 
     skin_tone = _skin_tone_lift(np.clip(out, 0, 255).astype(np.uint8), settings)
-    out = _blend_with_mask(out, skin_tone, skin_mask, 0.28 if settings.preset == "sample_match" else 0.42)
+    skin_region = build_feathered_region(suppress_mask_on_edges(skin_mask, rgb), inner_px=18, outer_px=64)
+    skin_alpha = skin_region.alpha * (1.0 - protect * 0.90) * (1.0 - hair_region.alpha * 0.78)
+    skin_tone = match_boundary_tone(np.clip(out, 0, 255).astype(np.uint8), skin_tone, skin_region.transition)
+    out = _blend_with_float_mask(out, skin_tone, skin_alpha, 0.28 if settings.preset == "sample_match" else 0.42)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -797,14 +866,83 @@ def _unsharp(rgb: np.ndarray, sigma: float, amount: float) -> np.ndarray:
     return cv2.addWeighted(rgb, 1.0 + amount, blur, -amount, 0)
 
 
+def build_feathered_region(mask: np.ndarray, inner_px: int, outer_px: int) -> FeatheredRegion:
+    mask_float = np.clip(mask.astype(np.float32) / 255.0, 0.0, 1.0)
+    binary = (mask_float > 0.025).astype(np.uint8)
+    if binary.max() == 0:
+        empty = np.zeros_like(mask_float, dtype=np.float32)
+        return FeatheredRegion(alpha=empty, core=empty, transition=empty)
+
+    inner_distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    outside_distance = cv2.distanceTransform(1 - binary, cv2.DIST_L2, 5)
+    signed_distance = inner_distance - outside_distance
+    outer = max(float(outer_px), 1.0)
+    inner = max(float(inner_px), 1.0)
+    alpha = _smoothstep(-outer, inner, signed_distance)
+    alpha *= cv2.GaussianBlur(mask_float, (0, 0), sigmaX=max(1.0, outer * 0.18))
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+    core = np.clip(_smoothstep(inner * 0.55, inner * 1.25, inner_distance) * mask_float, 0.0, 1.0).astype(np.float32)
+    transition = np.clip(alpha - core, 0.0, 1.0).astype(np.float32)
+    return FeatheredRegion(alpha=alpha, core=core, transition=transition)
+
+
+def suppress_mask_on_edges(mask: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    edge = cv2.magnitude(grad_x, grad_y)
+    if float(edge.max()) > 0.0:
+        edge /= float(edge.max())
+    edge = cv2.GaussianBlur(edge, (0, 0), sigmaX=2.8)
+    mask_float = mask.astype(np.float32) / 255.0
+    suppressed = mask_float * (1.0 - np.clip(edge, 0.0, 1.0) * 0.34)
+    return np.clip(suppressed * 255.0, 0, 255).astype(np.uint8)
+
+
+def match_boundary_tone(base: np.ndarray, layer: np.ndarray, transition_mask: np.ndarray) -> np.ndarray:
+    transition = np.clip(transition_mask.astype(np.float32), 0.0, 1.0)
+    if transition.max() <= 0.0:
+        return layer.astype(np.float32)
+
+    base_lab = cv2.cvtColor(np.clip(base, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    layer_lab = cv2.cvtColor(np.clip(layer, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    weight = transition[:, :, None]
+    total = float(np.sum(weight))
+    if total <= 1e-6:
+        return layer.astype(np.float32)
+
+    base_mean = np.sum(base_lab * weight, axis=(0, 1)) / total
+    layer_mean = np.sum(layer_lab * weight, axis=(0, 1)) / total
+    shift = (base_mean - layer_mean) * np.array([0.45, 0.62, 0.62], dtype=np.float32)
+    adjusted_lab = layer_lab + shift[None, None, :] * weight
+    return cv2.cvtColor(np.clip(adjusted_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+
+
+def _blend_with_float_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
+    alpha = np.clip(mask.astype(np.float32), 0.0, 1.0)[:, :, None] * opacity
+    return base.astype(np.float32) * (1.0 - alpha) + layer.astype(np.float32) * alpha
+
+
 def _blend_with_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
     alpha = (mask.astype(np.float32) / 255.0)[:, :, None] * opacity
     return base * (1.0 - alpha) + layer.astype(np.float32) * alpha
 
 
+def _screen_with_float_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
+    screen = 255.0 - (255.0 - base.astype(np.float32)) * (255.0 - layer.astype(np.float32)) / 255.0
+    return _blend_with_float_mask(base, screen, mask, opacity)
+
+
 def _screen_with_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
     screen = 255.0 - (255.0 - base) * (255.0 - layer.astype(np.float32)) / 255.0
     return _blend_with_mask(base, screen.astype(np.uint8), mask, opacity)
+
+
+def _soft_light_with_float_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
+    cb = np.clip(base.astype(np.float32) / 255.0, 0.0, 1.0)
+    cs = layer.astype(np.float32) / 255.0
+    soft = np.where(cs <= 0.5, cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb), cb + (2.0 * cs - 1.0) * (_soft_light_d(cb) - cb))
+    return _blend_with_float_mask(base, np.clip(soft * 255.0, 0, 255), mask, opacity)
 
 
 def _soft_light_with_mask(base: np.ndarray, layer: np.ndarray, mask: np.ndarray, opacity: float) -> np.ndarray:
@@ -821,6 +959,11 @@ def _soft_light_d(value: np.ndarray) -> np.ndarray:
 def _debug_overlay_mask(base: np.ndarray, mask: np.ndarray, color: tuple[int, int, int], opacity: float) -> np.ndarray:
     overlay = np.full_like(base, color, dtype=np.uint8)
     return _blend_with_mask(base.astype(np.float32), overlay, mask, opacity).astype(np.uint8)
+
+
+def _debug_overlay_float_mask(base: np.ndarray, mask: np.ndarray, color: tuple[int, int, int], opacity: float) -> np.ndarray:
+    overlay = np.full_like(base, color, dtype=np.uint8)
+    return _blend_with_float_mask(base.astype(np.float32), overlay, mask, opacity).astype(np.uint8)
 
 
 def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:
