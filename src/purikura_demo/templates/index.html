@@ -6,6 +6,7 @@
     <title>Purikura Demo</title>
     <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}" />
     <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+    <script src="{{ url_for('static', path='camera.js') }}" defer></script>
   </head>
   <body>
     <main class="app-shell">
@@ -24,10 +25,30 @@
             <h1>Purikura Demo</h1>
           </div>
 
-          <label class="file-drop">
-            <input id="image" name="image" type="file" accept="image/*" required />
-            <span>画像を選択</span>
-          </label>
+          <div class="input-source" data-camera-root>
+            <div class="input-tabs" role="tablist" aria-label="Input source">
+              <button class="input-tab is-active" type="button" data-input-mode="upload" aria-selected="true">Upload</button>
+              <button class="input-tab" type="button" data-input-mode="camera" aria-selected="false">Camera</button>
+            </div>
+
+            <label class="file-drop" data-upload-panel>
+              <input id="image" name="image" type="file" accept="image/*" required />
+              <span data-file-label>画像を選択</span>
+            </label>
+
+            <section class="camera-panel" data-camera-panel hidden>
+              <div class="camera-view">
+                <video id="camera-preview" autoplay muted playsinline></video>
+                <canvas id="camera-canvas" hidden></canvas>
+              </div>
+              <input id="camera_image" name="camera_image" type="hidden" />
+              <div class="camera-actions">
+                <button class="secondary-button" type="button" data-camera-start>カメラ起動</button>
+                <button class="primary-button compact" type="button" data-camera-capture disabled>撮影して加工</button>
+              </div>
+              <p class="camera-status" data-camera-status aria-live="polite"></p>
+            </section>
+          </div>
 
           <div class="field">
             <label for="preset">Preset</label>

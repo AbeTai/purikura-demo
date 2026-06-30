@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from dataclasses import asdict
 from pathlib import Path
 
@@ -35,7 +36,8 @@ async def index(request: Request) -> HTMLResponse:
 @app.post("/process", response_class=HTMLResponse)
 async def process_image(
     request: Request,
-    image: UploadFile = File(...),
+    image: UploadFile | None = File(None),
+    camera_image: str = Form(""),
     preset: str = Form(PurikuraSettings.preset),
     pipeline: str = Form("quality"),
     effect_mode: str = Form(PurikuraSettings.effect_mode),
@@ -47,12 +49,7 @@ async def process_image(
     decorations: bool = Form(False),
     white_background: bool = Form(PurikuraSettings.white_background),
 ) -> HTMLResponse:
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="画像ファイルを選択してください。")
-
-    source = await image.read()
-    if not source:
-        raise HTTPException(status_code=400, detail="画像ファイルが空です。")
+    source = await _read_source_image(image, camera_image)
 
     settings = PurikuraSettings(
         preset=preset,
@@ -88,3 +85,39 @@ async def process_image(
             "settings": asdict(settings),
         },
     )
+
+
+async def _read_source_image(image: UploadFile | None, camera_image: str) -> bytes:
+    if image is not None and image.filename:
+        if not image.content_type or not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="画像ファイルを選択してください。")
+
+        source = await image.read()
+        if not source:
+            raise HTTPException(status_code=400, detail="画像ファイルが空です。")
+        return source
+
+    camera_image = camera_image.strip()
+    if camera_image:
+        return _decode_camera_data_url(camera_image)
+
+    raise HTTPException(status_code=400, detail="画像ファイルを選択するか、カメラで撮影してください。")
+
+
+def _decode_camera_data_url(data_url: str) -> bytes:
+    try:
+        header, encoded = data_url.split(",", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="撮影画像の形式が不正です。") from exc
+
+    if not header.startswith("data:image/") or ";base64" not in header:
+        raise HTTPException(status_code=400, detail="撮影画像の形式が不正です。")
+
+    try:
+        source = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="撮影画像の読み込みに失敗しました。") from exc
+
+    if not source:
+        raise HTTPException(status_code=400, detail="撮影画像が空です。")
+    return source

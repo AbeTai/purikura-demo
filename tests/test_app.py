@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 
 import pytest
@@ -24,6 +25,9 @@ def test_index_renders() -> None:
     assert "name=\"pipeline\"" in response.text
     assert "name=\"effect_mode\"" in response.text
     assert "name=\"white_background\"" in response.text
+    assert "data-input-mode=\"camera\"" in response.text
+    assert "name=\"camera_image\"" in response.text
+    assert "camera.js" in response.text
 
 
 def test_process_image_returns_result_partial() -> None:
@@ -46,6 +50,25 @@ def test_process_image_returns_result_partial() -> None:
     assert "Download" in response.text
     assert "strong" in response.text
     assert "quality" in response.text
+
+
+def test_process_camera_image_returns_result_partial() -> None:
+    client = TestClient(app)
+    image_data = base64.b64encode(_sample_image()).decode("ascii")
+    response = client.post(
+        "/process",
+        data={
+            "camera_image": f"data:image/png;base64,{image_data}",
+            "preset": "natural",
+            "pipeline": "quality",
+            "effect_mode": "strong",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "data:image/jpeg;base64" in response.text
+    assert "Processed" in response.text
+    assert "Background Debug" in response.text
 
 
 def _sample_image() -> bytes:
