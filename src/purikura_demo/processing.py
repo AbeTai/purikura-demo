@@ -146,7 +146,12 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
     if faces:
         warped = _apply_geometry_warp(warped, faces, settings)
 
+    person_mask, background_segmenter = _build_person_mask(warped, faces)
     skin_mask = _build_skin_mask(warped, faces)
+    skin_segmenter = _segmenter_name(faces)
+    if skin_mask.max() == 0:
+        skin_mask = _build_person_skin_fallback(warped, person_mask)
+        skin_segmenter = "rembg-person-skin-fallback" if skin_mask.max() > 0 else "fallback-soft-mask"
     if skin_mask.max() == 0:
         skin_mask = _soft_full_image_mask(warped.shape[:2])
 
@@ -157,7 +162,6 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
     polished = _apply_glow_and_grain(toned, settings)
     if settings.pipeline == "quality" and faces:
         polished = _polish_retouch_boundaries(polished, warped, skin_mask, faces, settings)
-    person_mask, background_segmenter = _build_person_mask(warped, faces)
     background_debug = _build_background_debug(rgb, person_mask)
     if settings.white_background:
         polished = _apply_white_background(polished, person_mask)
@@ -179,7 +183,7 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
             "mode": settings.effect_mode,
             "pipeline": settings.pipeline,
             "accelerator": _accelerator_name(),
-            "segmenter": _segmenter_name(faces),
+            "segmenter": skin_segmenter,
             "background": "white" if settings.white_background else "original",
             "background_segmenter": background_segmenter,
         },
@@ -246,6 +250,10 @@ def _detect_faces_and_eyes(rgb: np.ndarray) -> list[FaceRegion]:
     if mediapipe_faces:
         return mediapipe_faces
 
+    mediapipe_detection_faces = _detect_faces_with_mediapipe_detection(rgb)
+    if mediapipe_detection_faces:
+        return mediapipe_detection_faces
+
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     profile_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
@@ -279,6 +287,37 @@ def _detect_faces_and_eyes(rgb: np.ndarray) -> list[FaceRegion]:
         eyes = _normalize_eyes(raw_eyes, x, y, w, h)
         faces.append(FaceRegion(int(x), int(y), int(w), int(h), eyes))
     return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
+
+
+def _detect_faces_with_mediapipe_detection(rgb: np.ndarray) -> list[FaceRegion]:
+    try:
+        import mediapipe as mp  # type: ignore[import-not-found]
+    except Exception:
+        return []
+
+    height, width = rgb.shape[:2]
+    try:
+        with mp.solutions.face_detection.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=0.32,
+        ) as detector:
+            result = detector.process(rgb)
+    except Exception:
+        return []
+
+    faces: list[FaceRegion] = []
+    for detection in result.detections or []:
+        relative_box = detection.location_data.relative_bounding_box
+        x = int(round(relative_box.xmin * width))
+        y = int(round(relative_box.ymin * height))
+        w = int(round(relative_box.width * width))
+        h = int(round(relative_box.height * height))
+        x, y, w, h = _expand_and_clip_box(x, y, w, h, width, height, expand=0.20)
+        if w < 32 or h < 32:
+            continue
+        eyes = _eyes_from_mediapipe_detection(detection, x, y, w, h, width, height)
+        faces.append(FaceRegion(x, y, w, h, eyes, detector="mediapipe-face-detection"))
+    return sorted(_dedupe_faces(faces), key=lambda face: face.w * face.h, reverse=True)
 
 
 def _detect_faces_with_mediapipe(rgb: np.ndarray) -> list[FaceRegion]:
@@ -330,6 +369,45 @@ def _detect_faces_with_mediapipe(rgb: np.ndarray) -> list[FaceRegion]:
     return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
 
 
+def _expand_and_clip_box(
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    image_width: int,
+    image_height: int,
+    expand: float,
+) -> tuple[int, int, int, int]:
+    pad_x = round(w * expand)
+    pad_y = round(h * expand)
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - pad_y)
+    x1 = min(image_width, x + w + pad_x)
+    y1 = min(image_height, y + h + pad_y)
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def _eyes_from_mediapipe_detection(
+    detection: Any,
+    face_x: int,
+    face_y: int,
+    face_w: int,
+    face_h: int,
+    image_width: int,
+    image_height: int,
+) -> tuple[tuple[float, float, float], ...]:
+    keypoints = getattr(detection.location_data, "relative_keypoints", [])
+    if len(keypoints) >= 2:
+        left = keypoints[0]
+        right = keypoints[1]
+        radius = max(face_w, face_h) * 0.075
+        return (
+            (float(left.x * image_width), float(left.y * image_height), radius),
+            (float(right.x * image_width), float(right.y * image_height), radius),
+        )
+    return _normalize_eyes(np.empty((0, 4), dtype=np.int32), face_x, face_y, face_w, face_h)
+
+
 def _eye_from_landmarks(
     landmarks: np.ndarray,
     eye_indices: tuple[int, ...],
@@ -349,6 +427,15 @@ def _dedupe_face_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int
     for box in sorted(boxes, key=lambda item: item[2] * item[3], reverse=True):
         if all(_box_iou(box, existing) < 0.28 for existing in kept):
             kept.append(tuple(int(value) for value in box))
+    return kept
+
+
+def _dedupe_faces(faces: list[FaceRegion]) -> list[FaceRegion]:
+    kept: list[FaceRegion] = []
+    for face in sorted(faces, key=lambda item: item.w * item.h, reverse=True):
+        box = (face.x, face.y, face.w, face.h)
+        if all(_box_iou(box, (existing.x, existing.y, existing.w, existing.h)) < 0.28 for existing in kept):
+            kept.append(face)
     return kept
 
 
@@ -580,6 +667,43 @@ def _build_skin_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> np.ndarray:
     dark_detail = cv2.inRange(hsv, np.array([0, 0, 0], dtype=np.uint8), np.array([180, 190, 126], dtype=np.uint8))
     dark_detail = cv2.GaussianBlur(dark_detail, (0, 0), sigmaX=5.0).astype(np.float32) / 255.0
     mask *= 1.0 - dark_detail * 0.30
+    return np.clip(mask * 255.0, 0, 255).astype(np.uint8)
+
+
+def _build_person_skin_fallback(rgb: np.ndarray, person_mask: np.ndarray) -> np.ndarray:
+    person = np.clip(person_mask.astype(np.float32) / 255.0, 0.0, 1.0)
+    if person.max() <= 0:
+        return np.zeros(rgb.shape[:2], dtype=np.uint8)
+
+    ys, xs = np.where(person > 0.18)
+    if len(xs) == 0:
+        return np.zeros(rgb.shape[:2], dtype=np.uint8)
+
+    top = int(ys.min())
+    bottom = int(ys.max())
+    height = max(1, bottom - top)
+    y = np.arange(rgb.shape[0], dtype=np.float32)[:, None]
+    upper_weight = 1.0 - np.clip((y - top) / (height * 0.72), 0.0, 1.0)
+    upper_weight = cv2.GaussianBlur(upper_weight, (0, 0), sigmaX=9.0)
+
+    ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+    skin_color = cv2.inRange(ycrcb, np.array([0, 128, 72], dtype=np.uint8), np.array([255, 184, 150], dtype=np.uint8))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    skin_luma_guard = cv2.inRange(hsv, np.array([0, 12, 72], dtype=np.uint8), np.array([28, 190, 255], dtype=np.uint8))
+    skin = np.maximum(skin_color, skin_luma_guard)
+    skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
+    skin = cv2.GaussianBlur(skin, (0, 0), sigmaX=7.0).astype(np.float32) / 255.0
+
+    dark = cv2.inRange(hsv, np.array([0, 0, 0], dtype=np.uint8), np.array([180, 180, 118], dtype=np.uint8))
+    dark = cv2.GaussianBlur(dark, (0, 0), sigmaX=5.0).astype(np.float32) / 255.0
+
+    cloth_blue = cv2.inRange(hsv, np.array([85, 30, 45], dtype=np.uint8), np.array([135, 255, 255], dtype=np.uint8))
+    cloth_blue = cv2.GaussianBlur(cloth_blue, (0, 0), sigmaX=5.0).astype(np.float32) / 255.0
+
+    mask = person * upper_weight * (0.10 + skin * 0.90)
+    mask *= 1.0 - dark * 0.58
+    mask *= 1.0 - cloth_blue * 0.80
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=5.0)
     return np.clip(mask * 255.0, 0, 255).astype(np.uint8)
 
 
@@ -1305,6 +1429,8 @@ def _accelerator_name() -> str:
 def _segmenter_name(faces: list[FaceRegion]) -> str:
     if any(face.detector == "mediapipe-face-mesh" for face in faces):
         return "mediapipe-face-mesh"
+    if any(face.detector == "mediapipe-face-detection" for face in faces):
+        return "mediapipe-face-detection"
     if faces:
         return "opencv-haar-fallback"
     return "fallback-soft-mask"

@@ -17,6 +17,7 @@ from purikura_demo.processing import (
     _build_part_masks,
     _build_person_mask,
     _build_skin_mask,
+    _detect_faces_and_eyes,
     _extract_rembg_alpha,
     _refine_hair_mask,
     suppress_mask_on_edges,
@@ -65,7 +66,13 @@ def test_strong_effect_mode_is_reported() -> None:
     assert result.metrics["pipeline"] == "quality"
     assert result.metrics["preset"] == "sample_match"
     assert result.metrics["accelerator"] in {"opencv-cpu", "torch-mps"}
-    assert result.metrics["segmenter"] in {"mediapipe-face-mesh", "opencv-haar-fallback", "fallback-soft-mask"}
+    assert result.metrics["segmenter"] in {
+        "mediapipe-face-mesh",
+        "mediapipe-face-detection",
+        "opencv-haar-fallback",
+        "rembg-person-skin-fallback",
+        "fallback-soft-mask",
+    }
     assert result.metrics["background_segmenter"] in {
         "rembg-birefnet-portrait",
         "rembg-isnet-general-use",
@@ -86,6 +93,40 @@ def test_skin_mask_combines_multiple_faces() -> None:
 
     assert mask[145, 165] > 0
     assert mask[155, 455] > 0
+
+
+def test_face_detection_falls_back_to_mediapipe_detector(monkeypatch) -> None:
+    rgb = np.full((720, 1280, 3), 235, dtype=np.uint8)
+    expected = FaceRegion(
+        480,
+        160,
+        300,
+        360,
+        ((575.0, 305.0, 28.0), (685.0, 305.0, 28.0)),
+        detector="mediapipe-face-detection",
+    )
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_with_mediapipe", lambda image: [])
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_with_mediapipe_detection", lambda image: [expected])
+
+    faces = _detect_faces_and_eyes(rgb)
+
+    assert faces == [expected]
+
+
+def test_no_face_uses_person_skin_fallback(monkeypatch) -> None:
+    person_mask = np.zeros((560, 420), dtype=np.uint8)
+    person_mask[70:520, 90:330] = 255
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_and_eyes", lambda image: [])
+    monkeypatch.setattr(
+        "purikura_demo.processing._build_person_mask",
+        lambda image, faces: (person_mask, "rembg-birefnet-portrait"),
+    )
+
+    result = apply_purikura_effect(_sample_face_image(), PurikuraSettings(preset="natural"))
+
+    assert result.metrics["faces"] == 0
+    assert result.metrics["segmenter"] == "rembg-person-skin-fallback"
+    assert result.metrics["background_segmenter"] == "rembg-birefnet-portrait"
 
 
 def test_person_mask_combines_multiple_faces() -> None:
