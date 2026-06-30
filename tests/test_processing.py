@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 
 import numpy as np
+import pytest
 from PIL import Image, ImageDraw
 
 from purikura_demo.processing import (
@@ -16,10 +17,16 @@ from purikura_demo.processing import (
     _build_part_masks,
     _build_person_mask,
     _build_skin_mask,
+    _extract_rembg_alpha,
     _refine_hair_mask,
     suppress_mask_on_edges,
     apply_purikura_effect,
 )
+
+
+@pytest.fixture(autouse=True)
+def disable_rembg_model_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: None)
 
 
 def test_apply_purikura_effect_returns_jpeg() -> None:
@@ -59,7 +66,12 @@ def test_strong_effect_mode_is_reported() -> None:
     assert result.metrics["preset"] == "sample_match"
     assert result.metrics["accelerator"] in {"opencv-cpu", "torch-mps"}
     assert result.metrics["segmenter"] in {"mediapipe-face-mesh", "opencv-haar-fallback", "fallback-soft-mask"}
-    assert result.metrics["background_segmenter"] in {"mediapipe-selfie-segmentation", "face-fallback-person-mask"}
+    assert result.metrics["background_segmenter"] in {
+        "rembg-birefnet-portrait",
+        "rembg-isnet-general-use",
+        "mediapipe-selfie-segmentation",
+        "face-fallback-person-mask",
+    }
 
 
 def test_skin_mask_combines_multiple_faces() -> None:
@@ -87,7 +99,54 @@ def test_person_mask_combines_multiple_faces() -> None:
 
     assert mask[150, 165] > 0
     assert mask[160, 455] > 0
-    assert segmenter in {"mediapipe-selfie-segmentation", "face-fallback-person-mask"}
+    assert segmenter in {
+        "rembg-birefnet-portrait",
+        "rembg-isnet-general-use",
+        "mediapipe-selfie-segmentation",
+        "face-fallback-person-mask",
+    }
+
+
+def test_person_mask_uses_rembg_alpha(monkeypatch) -> None:
+    rgb = np.full((80, 100, 3), 235, dtype=np.uint8)
+    rembg_alpha = np.zeros((80, 100), dtype=np.float32)
+    rembg_alpha[20:60, 25:75] = 1.0
+
+    def fake_rembg(image: np.ndarray, model_name: str) -> np.ndarray | None:
+        assert image.shape == rgb.shape
+        return rembg_alpha if model_name == "birefnet-portrait" else None
+
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", fake_rembg)
+    monkeypatch.setattr("purikura_demo.processing._detect_person_with_mediapipe", lambda image: None)
+
+    mask, segmenter = _build_person_mask(rgb, [])
+
+    assert segmenter == "rembg-birefnet-portrait"
+    assert mask[40, 50] > 200
+    assert mask[5, 5] < 16
+
+
+def test_person_mask_falls_back_when_rembg_unavailable(monkeypatch) -> None:
+    rgb = np.full((160, 160, 3), 235, dtype=np.uint8)
+    face = FaceRegion(45, 30, 70, 90, ((70.0, 65.0, 12.0), (92.0, 65.0, 12.0)))
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: None)
+    monkeypatch.setattr("purikura_demo.processing._detect_person_with_mediapipe", lambda image: None)
+
+    mask, segmenter = _build_person_mask(rgb, [face])
+
+    assert segmenter == "face-fallback-person-mask"
+    assert mask[75, 80] > 0
+
+
+def test_extract_rembg_alpha_accepts_rgba() -> None:
+    rgba = np.zeros((20, 30, 4), dtype=np.uint8)
+    rgba[4:16, 7:23, 3] = 240
+
+    alpha = _extract_rembg_alpha(rgba, (20, 30))
+
+    assert alpha is not None
+    assert alpha[10, 15] > 0.9
+    assert alpha[0, 0] == 0.0
 
 
 def test_part_masks_use_landmark_polygons() -> None:

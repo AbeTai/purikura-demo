@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import io
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
 from purikura_demo.app import app
+
+
+@pytest.fixture(autouse=True)
+def disable_rembg_model_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: None)
 
 
 def test_index_renders() -> None:

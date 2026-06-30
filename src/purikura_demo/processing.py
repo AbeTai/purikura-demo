@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import cv2
@@ -997,12 +998,77 @@ def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:
 
 
 def _build_person_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> tuple[np.ndarray, str]:
-    mediapipe_mask = _detect_person_with_mediapipe(rgb)
     fallback_mask = _fallback_person_mask(rgb.shape[:2], faces)
+    rembg_mask, rembg_segmenter = _detect_person_with_rembg(rgb)
+    if rembg_mask is not None and rembg_mask.max() > 0:
+        mask = _merge_person_masks(rembg_mask, fallback_mask, fallback_weight=0.62)
+        return (_refine_person_mask(mask), rembg_segmenter)
+
+    mediapipe_mask = _detect_person_with_mediapipe(rgb)
     if mediapipe_mask is not None and mediapipe_mask.max() > 0:
-        mask = np.maximum(mediapipe_mask, fallback_mask.astype(np.float32) / 255.0 * 0.78)
+        mask = _merge_person_masks(mediapipe_mask, fallback_mask, fallback_weight=0.78)
         return (_refine_person_mask(mask), "mediapipe-selfie-segmentation")
     return (_refine_person_mask(fallback_mask.astype(np.float32) / 255.0), "face-fallback-person-mask")
+
+
+def _detect_person_with_rembg(rgb: np.ndarray) -> tuple[np.ndarray | None, str]:
+    for model_name in ("birefnet-portrait", "isnet-general-use"):
+        mask = _run_rembg_model(rgb, model_name)
+        if mask is not None and mask.max() > 0:
+            return (mask, f"rembg-{model_name}")
+    return (None, "")
+
+
+def _run_rembg_model(rgb: np.ndarray, model_name: str) -> np.ndarray | None:
+    try:
+        from rembg import remove  # type: ignore[import-not-found]
+    except Exception:
+        return None
+
+    try:
+        session = _rembg_session(model_name)
+        rgba = remove(
+            rgb,
+            session=session,
+            only_mask=False,
+            post_process_mask=True,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=230,
+            alpha_matting_background_threshold=20,
+            alpha_matting_erode_size=8,
+        )
+    except Exception:
+        return None
+    return _extract_rembg_alpha(rgba, rgb.shape[:2])
+
+
+@lru_cache(maxsize=2)
+def _rembg_session(model_name: str) -> Any:
+    from rembg import new_session  # type: ignore[import-not-found]
+
+    return new_session(model_name)
+
+
+def _extract_rembg_alpha(output: Any, shape: tuple[int, int]) -> np.ndarray | None:
+    array = np.asarray(output)
+    if array.ndim == 2:
+        alpha = array.astype(np.float32)
+    elif array.ndim == 3 and array.shape[2] >= 4:
+        alpha = array[:, :, 3].astype(np.float32)
+    elif array.ndim == 3 and array.shape[2] == 1:
+        alpha = array[:, :, 0].astype(np.float32)
+    else:
+        return None
+    if alpha.shape[:2] != shape:
+        alpha = cv2.resize(alpha, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+    if alpha.max() > 1.0:
+        alpha /= 255.0
+    return np.clip(alpha, 0.0, 1.0)
+
+
+def _merge_person_masks(primary: np.ndarray, fallback_mask: np.ndarray, fallback_weight: float) -> np.ndarray:
+    fallback = fallback_mask.astype(np.float32) / 255.0
+    return np.maximum(np.clip(primary.astype(np.float32), 0.0, 1.0), fallback * fallback_weight)
 
 
 def _detect_person_with_mediapipe(rgb: np.ndarray) -> np.ndarray | None:
