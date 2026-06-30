@@ -38,10 +38,22 @@
       <dt>Segmenter</dt>
       <dd>{{ metrics.segmenter }}</dd>
     </div>
+    <div>
+      <dt>Background</dt>
+      <dd>{{ metrics.background }}</dd>
+    </div>
+    <div>
+      <dt>BG Segmenter</dt>
+      <dd>{{ metrics.background_segmenter }}</dd>
+    </div>
   </dl>
   <a class="download-link" href="{{ image_data }}" download="purikura-demo.jpg">Download</a>
   <figure class="debug-card">
     <figcaption>Segmentation Debug</figcaption>
     <img src="{{ segmentation_image_data }}" alt="セグメンテーションデバッグ画像" />
+  </figure>
+  <figure class="debug-card">
+    <figcaption>Background Debug</figcaption>
+    <img src="{{ background_image_data }}" alt="背景を白塗りしたデバッグ画像" />
   </figure>
 </article>

@@ -45,6 +45,7 @@ async def process_image(
     face_slim: float = Form(PurikuraSettings.face_slim),
     glow: float = Form(PurikuraSettings.glow),
     decorations: bool = Form(False),
+    white_background: bool = Form(PurikuraSettings.white_background),
 ) -> HTMLResponse:
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="画像ファイルを選択してください。")
@@ -63,6 +64,7 @@ async def process_image(
         face_slim=face_slim,
         glow=glow,
         decorations=decorations,
+        white_background=white_background,
     )
 
     try:
@@ -73,6 +75,7 @@ async def process_image(
     original_encoded = base64.b64encode(result.original_bytes).decode("ascii")
     processed_encoded = base64.b64encode(result.image_bytes).decode("ascii")
     segmentation_encoded = base64.b64encode(result.segmentation_bytes).decode("ascii")
+    background_encoded = base64.b64encode(result.background_bytes).decode("ascii")
     return templates.TemplateResponse(
         request,
         "_result.html",
@@ -80,6 +83,7 @@ async def process_image(
             "original_image_data": f"data:image/jpeg;base64,{original_encoded}",
             "image_data": f"data:image/jpeg;base64,{processed_encoded}",
             "segmentation_image_data": f"data:image/jpeg;base64,{segmentation_encoded}",
+            "background_image_data": f"data:image/jpeg;base64,{background_encoded}",
             "metrics": result.metrics,
             "settings": asdict(settings),
         },

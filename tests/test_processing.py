@@ -14,6 +14,7 @@ from purikura_demo.processing import (
     PurikuraSettings,
     build_feathered_region,
     _build_part_masks,
+    _build_person_mask,
     _build_skin_mask,
     _refine_hair_mask,
     suppress_mask_on_edges,
@@ -28,14 +29,18 @@ def test_apply_purikura_effect_returns_jpeg() -> None:
     image = Image.open(io.BytesIO(result.image_bytes))
     original = Image.open(io.BytesIO(result.original_bytes))
     segmentation = Image.open(io.BytesIO(result.segmentation_bytes))
+    background = Image.open(io.BytesIO(result.background_bytes))
     assert image.format == "JPEG"
     assert original.format == "JPEG"
     assert segmentation.format == "JPEG"
+    assert background.format == "JPEG"
     assert image.size == (420, 560)
     assert original.size == (420, 560)
     assert segmentation.size == (420, 560)
+    assert background.size == (420, 560)
     assert result.metrics["width"] == 420
     assert result.metrics["height"] == 560
+    assert result.metrics["background"] == "white"
 
 
 def test_unknown_preset_falls_back_to_strawberry() -> None:
@@ -54,6 +59,7 @@ def test_strong_effect_mode_is_reported() -> None:
     assert result.metrics["preset"] == "sample_match"
     assert result.metrics["accelerator"] in {"opencv-cpu", "torch-mps"}
     assert result.metrics["segmenter"] in {"mediapipe-face-mesh", "opencv-haar-fallback", "fallback-soft-mask"}
+    assert result.metrics["background_segmenter"] in {"mediapipe-selfie-segmentation", "face-fallback-person-mask"}
 
 
 def test_skin_mask_combines_multiple_faces() -> None:
@@ -68,6 +74,20 @@ def test_skin_mask_combines_multiple_faces() -> None:
 
     assert mask[145, 165] > 0
     assert mask[155, 455] > 0
+
+
+def test_person_mask_combines_multiple_faces() -> None:
+    rgb = np.full((360, 640, 3), 235, dtype=np.uint8)
+    faces = [
+        FaceRegion(90, 60, 150, 190, ((140.0, 130.0, 24.0), (190.0, 130.0, 24.0))),
+        FaceRegion(380, 70, 150, 190, ((430.0, 140.0, 24.0), (480.0, 140.0, 24.0))),
+    ]
+
+    mask, segmenter = _build_person_mask(rgb, faces)
+
+    assert mask[150, 165] > 0
+    assert mask[160, 455] > 0
+    assert segmenter in {"mediapipe-selfie-segmentation", "face-fallback-person-mask"}
 
 
 def test_part_masks_use_landmark_polygons() -> None:

@@ -17,6 +17,7 @@ def test_index_renders() -> None:
     assert "hx-post=\"/process\"" in response.text
     assert "name=\"pipeline\"" in response.text
     assert "name=\"effect_mode\"" in response.text
+    assert "name=\"white_background\"" in response.text
 
 
 def test_process_image_returns_result_partial() -> None:
@@ -33,6 +34,8 @@ def test_process_image_returns_result_partial() -> None:
     assert "Original" in response.text
     assert "Processed" in response.text
     assert "Segmentation Debug" in response.text
+    assert "Background Debug" in response.text
+    assert "BG Segmenter" in response.text
     assert "Segmenter" in response.text
     assert "Download" in response.text
     assert "strong" in response.text

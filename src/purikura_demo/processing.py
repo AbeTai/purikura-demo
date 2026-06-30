@@ -72,6 +72,7 @@ class PurikuraSettings:
     face_slim: float = 0.58
     glow: float = 0.42
     decorations: bool = False
+    white_background: bool = True
 
     @staticmethod
     def available_presets() -> tuple[tuple[str, str], ...]:
@@ -106,6 +107,7 @@ class ProcessedImage:
     image_bytes: bytes
     original_bytes: bytes
     segmentation_bytes: bytes
+    background_bytes: bytes
     metrics: dict[str, Any]
 
 
@@ -154,14 +156,20 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
     polished = _apply_glow_and_grain(toned, settings)
     if settings.pipeline == "quality" and faces:
         polished = _polish_retouch_boundaries(polished, warped, skin_mask, faces, settings)
+    person_mask, background_segmenter = _build_person_mask(warped, faces)
+    background_debug = _build_background_debug(rgb, person_mask)
+    if settings.white_background:
+        polished = _apply_white_background(polished, person_mask)
     decorated = _draw_decorations(polished, settings) if settings.decorations else polished
 
     output = Image.fromarray(decorated).convert("RGB")
     segmentation = Image.fromarray(_build_segmentation_debug(rgb, faces, skin_mask, settings)).convert("RGB")
+    background = Image.fromarray(background_debug).convert("RGB")
     return ProcessedImage(
         image_bytes=_encode_jpeg(output, quality=94),
         original_bytes=_encode_jpeg(Image.fromarray(rgb).convert("RGB"), quality=92),
         segmentation_bytes=_encode_jpeg(segmentation, quality=92),
+        background_bytes=_encode_jpeg(background, quality=92),
         metrics={
             "width": output.width,
             "height": output.height,
@@ -171,6 +179,8 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
             "pipeline": settings.pipeline,
             "accelerator": _accelerator_name(),
             "segmenter": _segmenter_name(faces),
+            "background": "white" if settings.white_background else "original",
+            "background_segmenter": background_segmenter,
         },
     )
 
@@ -218,6 +228,7 @@ def _clamp_settings(settings: PurikuraSettings) -> PurikuraSettings:
         face_slim=unit(settings.face_slim),
         glow=unit(settings.glow),
         decorations=bool(settings.decorations),
+        white_background=bool(settings.white_background),
     )
 
 
@@ -983,6 +994,91 @@ def _soft_full_image_mask(shape: tuple[int, int]) -> np.ndarray:
     mask = np.zeros((height, width), dtype=np.uint8)
     cv2.ellipse(mask, (width // 2, height // 2), (round(width * 0.36), round(height * 0.42)), 0, 0, 360, 120, -1)
     return cv2.GaussianBlur(mask, (0, 0), sigmaX=max(width, height) * 0.025)
+
+
+def _build_person_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> tuple[np.ndarray, str]:
+    mediapipe_mask = _detect_person_with_mediapipe(rgb)
+    fallback_mask = _fallback_person_mask(rgb.shape[:2], faces)
+    if mediapipe_mask is not None and mediapipe_mask.max() > 0:
+        mask = np.maximum(mediapipe_mask, fallback_mask.astype(np.float32) / 255.0 * 0.78)
+        return (_refine_person_mask(mask), "mediapipe-selfie-segmentation")
+    return (_refine_person_mask(fallback_mask.astype(np.float32) / 255.0), "face-fallback-person-mask")
+
+
+def _detect_person_with_mediapipe(rgb: np.ndarray) -> np.ndarray | None:
+    try:
+        import mediapipe as mp  # type: ignore[import-not-found]
+    except Exception:
+        return None
+
+    try:
+        with mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter:
+            result = segmenter.process(rgb)
+    except Exception:
+        return None
+    mask = getattr(result, "segmentation_mask", None)
+    if mask is None:
+        return None
+    return np.clip(mask.astype(np.float32), 0.0, 1.0)
+
+
+def _fallback_person_mask(shape: tuple[int, int], faces: list[FaceRegion]) -> np.ndarray:
+    height, width = shape
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if not faces:
+        return mask
+    for face in faces:
+        face_center = (round(face.x + face.w * 0.50), round(face.y + face.h * 0.56))
+        cv2.ellipse(mask, face_center, (round(face.w * 0.68), round(face.h * 0.74)), 0, 0, 360, 245, -1)
+        hair_center = (round(face.x + face.w * 0.50), round(face.y + face.h * 0.25))
+        cv2.ellipse(mask, hair_center, (round(face.w * 0.76), round(face.h * 0.58)), 0, 0, 360, 230, -1)
+        torso_center = (round(face.x + face.w * 0.50), round(face.y + face.h * 1.32))
+        cv2.ellipse(mask, torso_center, (round(face.w * 0.92), round(face.h * 0.88)), 0, 0, 360, 205, -1)
+        shoulder_y = min(height - 1, round(face.y + face.h * 1.08))
+        bottom_y = min(height - 1, round(face.y + face.h * 1.98))
+        cv2.rectangle(
+            mask,
+            (max(0, round(face.x - face.w * 0.28)), shoulder_y),
+            (min(width - 1, round(face.x + face.w * 1.28)), bottom_y),
+            150,
+            -1,
+        )
+    return cv2.GaussianBlur(mask, (0, 0), sigmaX=max(8.0, min(width, height) * 0.018))
+
+
+def _refine_person_mask(mask: np.ndarray) -> np.ndarray:
+    alpha = np.clip(mask.astype(np.float32), 0.0, 1.0)
+    binary = (alpha > 0.34).astype(np.uint8)
+    kernel = np.ones((9, 9), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+    alpha = np.maximum(alpha, binary.astype(np.float32) * 0.86)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=5.5)
+    return np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+
+
+def _apply_white_background(rgb: np.ndarray, person_mask: np.ndarray) -> np.ndarray:
+    alpha = (person_mask.astype(np.float32) / 255.0)[:, :, None]
+    white = np.full_like(rgb, 255, dtype=np.float32)
+    return np.clip(rgb.astype(np.float32) * alpha + white * (1.0 - alpha), 0, 255).astype(np.uint8)
+
+
+def _build_background_debug(rgb: np.ndarray, person_mask: np.ndarray) -> np.ndarray:
+    debug = _apply_white_background(rgb, person_mask)
+    binary = (person_mask > 128).astype(np.uint8)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(debug, contours, -1, (21, 168, 143), max(2, round(min(rgb.shape[:2]) * 0.003)))
+    cv2.putText(
+        debug,
+        "background painted white",
+        (24, min(debug.shape[0] - 24, 40)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        (30, 30, 30),
+        2,
+        cv2.LINE_AA,
+    )
+    return debug
 
 
 def _apply_color_preset(rgb: np.ndarray, skin_mask: np.ndarray, settings: PurikuraSettings) -> np.ndarray:
