@@ -126,6 +126,26 @@ def test_person_mask_uses_rembg_alpha(monkeypatch) -> None:
     assert mask[5, 5] < 16
 
 
+def test_rembg_mask_does_not_promote_face_fallback_outline(monkeypatch) -> None:
+    rgb = np.full((180, 180, 3), 235, dtype=np.uint8)
+    rembg_alpha = np.zeros((180, 180), dtype=np.float32)
+    rembg_alpha[70:155, 65:115] = 1.0
+    face = FaceRegion(35, 20, 100, 120, ((70.0, 75.0, 14.0), (100.0, 75.0, 14.0)))
+
+    def fake_rembg(image: np.ndarray, model_name: str) -> np.ndarray | None:
+        assert image.shape == rgb.shape
+        return rembg_alpha if model_name == "birefnet-portrait" else None
+
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", fake_rembg)
+    monkeypatch.setattr("purikura_demo.processing._detect_person_with_mediapipe", lambda image: None)
+
+    mask, segmenter = _build_person_mask(rgb, [face])
+
+    assert segmenter == "rembg-birefnet-portrait"
+    assert mask[100, 90] > 200
+    assert mask[35, 85] < 48
+
+
 def test_person_mask_falls_back_when_rembg_unavailable(monkeypatch) -> None:
     rgb = np.full((160, 160, 3), 235, dtype=np.uint8)
     face = FaceRegion(45, 30, 70, 90, ((70.0, 65.0, 12.0), (92.0, 65.0, 12.0)))

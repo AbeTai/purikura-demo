@@ -1001,8 +1001,8 @@ def _build_person_mask(rgb: np.ndarray, faces: list[FaceRegion]) -> tuple[np.nda
     fallback_mask = _fallback_person_mask(rgb.shape[:2], faces)
     rembg_mask, rembg_segmenter = _detect_person_with_rembg(rgb)
     if rembg_mask is not None and rembg_mask.max() > 0:
-        mask = _merge_person_masks(rembg_mask, fallback_mask, fallback_weight=0.62)
-        return (_refine_person_mask(mask), rembg_segmenter)
+        mask = _merge_rembg_with_fallback_holes(rembg_mask, fallback_mask)
+        return (_refine_rembg_person_mask(mask), rembg_segmenter)
 
     mediapipe_mask = _detect_person_with_mediapipe(rgb)
     if mediapipe_mask is not None and mediapipe_mask.max() > 0:
@@ -1071,6 +1071,28 @@ def _merge_person_masks(primary: np.ndarray, fallback_mask: np.ndarray, fallback
     return np.maximum(np.clip(primary.astype(np.float32), 0.0, 1.0), fallback * fallback_weight)
 
 
+def _odd_kernel(value: int) -> int:
+    return max(3, value if value % 2 == 1 else value + 1)
+
+
+def _merge_rembg_with_fallback_holes(primary: np.ndarray, fallback_mask: np.ndarray) -> np.ndarray:
+    alpha = np.clip(primary.astype(np.float32), 0.0, 1.0)
+    fallback = fallback_mask.astype(np.float32) / 255.0
+    if fallback.max() == 0:
+        return alpha
+
+    support = (alpha > 0.18).astype(np.uint8)
+    if support.max() == 0:
+        return alpha
+
+    height, width = alpha.shape
+    kernel_size = _odd_kernel(max(9, round(min(width, height) * 0.026)))
+    closed = cv2.morphologyEx(support, cv2.MORPH_CLOSE, np.ones((kernel_size, kernel_size), np.uint8), iterations=1)
+    hole_guard = (closed > 0) & (support == 0)
+    guarded_fallback = fallback * hole_guard.astype(np.float32) * 0.42
+    return np.maximum(alpha, guarded_fallback)
+
+
 def _detect_person_with_mediapipe(rgb: np.ndarray) -> np.ndarray | None:
     try:
         import mediapipe as mp  # type: ignore[import-not-found]
@@ -1120,6 +1142,17 @@ def _refine_person_mask(mask: np.ndarray) -> np.ndarray:
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
     alpha = np.maximum(alpha, binary.astype(np.float32) * 0.86)
     alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=5.5)
+    return np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+
+
+def _refine_rembg_person_mask(mask: np.ndarray) -> np.ndarray:
+    alpha = np.clip(mask.astype(np.float32), 0.0, 1.0)
+    alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+    alpha = cv2.medianBlur(alpha_u8, 3).astype(np.float32) / 255.0
+    core = (alpha > 0.72).astype(np.uint8)
+    core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    alpha = np.maximum(alpha, core.astype(np.float32) * 0.95)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=1.4)
     return np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
 
 
