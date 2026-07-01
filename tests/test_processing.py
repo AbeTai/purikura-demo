@@ -11,6 +11,7 @@ from purikura_demo.processing import (
     LEFT_EYE,
     LIPS,
     NOSE,
+    RIGHT_EYE,
     FaceRegion,
     PurikuraSettings,
     build_feathered_region,
@@ -30,7 +31,8 @@ def disable_rembg_model_download(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: None)
 
 
-def test_apply_purikura_effect_returns_jpeg() -> None:
+def test_apply_purikura_effect_returns_jpeg(monkeypatch) -> None:
+    _install_quality_pipeline(monkeypatch)
     source = _sample_face_image()
     result = apply_purikura_effect(source, PurikuraSettings(decorations=True))
 
@@ -51,14 +53,16 @@ def test_apply_purikura_effect_returns_jpeg() -> None:
     assert result.metrics["background"] == "white"
 
 
-def test_unknown_preset_falls_back_to_strawberry() -> None:
+def test_unknown_preset_falls_back_to_strawberry(monkeypatch) -> None:
+    _install_quality_pipeline(monkeypatch)
     source = _sample_face_image()
     result = apply_purikura_effect(source, PurikuraSettings(preset="missing"))
 
     assert result.metrics["preset"] == "strawberry"
 
 
-def test_strong_effect_mode_is_reported() -> None:
+def test_strong_effect_mode_is_reported(monkeypatch) -> None:
+    _install_quality_pipeline(monkeypatch)
     source = _sample_face_image()
     result = apply_purikura_effect(source, PurikuraSettings(effect_mode="ultra", eye_enlarge=1.0, face_slim=1.0))
 
@@ -66,19 +70,8 @@ def test_strong_effect_mode_is_reported() -> None:
     assert result.metrics["pipeline"] == "quality"
     assert result.metrics["preset"] == "sample_match"
     assert result.metrics["accelerator"] in {"opencv-cpu", "torch-mps"}
-    assert result.metrics["segmenter"] in {
-        "mediapipe-face-mesh",
-        "mediapipe-face-detection",
-        "opencv-haar-fallback",
-        "rembg-person-skin-fallback",
-        "fallback-soft-mask",
-    }
-    assert result.metrics["background_segmenter"] in {
-        "rembg-birefnet-portrait",
-        "rembg-isnet-general-use",
-        "mediapipe-selfie-segmentation",
-        "face-fallback-person-mask",
-    }
+    assert result.metrics["segmenter"] == "mediapipe-face-mesh"
+    assert result.metrics["background_segmenter"] == "rembg-birefnet-portrait"
 
 
 def test_skin_mask_combines_multiple_faces() -> None:
@@ -95,57 +88,38 @@ def test_skin_mask_combines_multiple_faces() -> None:
     assert mask[155, 455] > 0
 
 
-def test_face_detection_falls_back_to_mediapipe_detector(monkeypatch) -> None:
+def test_face_detection_requires_mediapipe_mesh(monkeypatch) -> None:
     rgb = np.full((720, 1280, 3), 235, dtype=np.uint8)
-    expected = FaceRegion(
-        480,
-        160,
-        300,
-        360,
-        ((575.0, 305.0, 28.0), (685.0, 305.0, 28.0)),
-        detector="mediapipe-face-detection",
-    )
     monkeypatch.setattr("purikura_demo.processing._detect_faces_with_mediapipe", lambda image: [])
-    monkeypatch.setattr("purikura_demo.processing._detect_faces_with_mediapipe_detection", lambda image: [expected])
 
     faces = _detect_faces_and_eyes(rgb)
 
-    assert faces == [expected]
+    assert faces == []
 
 
-def test_no_face_uses_person_skin_fallback(monkeypatch) -> None:
-    person_mask = np.zeros((560, 420), dtype=np.uint8)
-    person_mask[70:520, 90:330] = 255
+def test_no_face_fails_instead_of_using_soft_mask(monkeypatch) -> None:
     monkeypatch.setattr("purikura_demo.processing._detect_faces_and_eyes", lambda image: [])
-    monkeypatch.setattr(
-        "purikura_demo.processing._build_person_mask",
-        lambda image, faces: (person_mask, "rembg-birefnet-portrait"),
-    )
 
-    result = apply_purikura_effect(_sample_face_image(), PurikuraSettings(preset="natural"))
-
-    assert result.metrics["faces"] == 0
-    assert result.metrics["segmenter"] == "rembg-person-skin-fallback"
-    assert result.metrics["background_segmenter"] == "rembg-birefnet-portrait"
+    with pytest.raises(ValueError, match="MediaPipe FaceMesh"):
+        apply_purikura_effect(_sample_face_image(), PurikuraSettings(preset="natural"))
 
 
-def test_person_mask_combines_multiple_faces() -> None:
+def test_person_mask_combines_multiple_faces(monkeypatch) -> None:
     rgb = np.full((360, 640, 3), 235, dtype=np.uint8)
     faces = [
         FaceRegion(90, 60, 150, 190, ((140.0, 130.0, 24.0), (190.0, 130.0, 24.0))),
         FaceRegion(380, 70, 150, 190, ((430.0, 140.0, 24.0), (480.0, 140.0, 24.0))),
     ]
 
+    rembg_alpha = np.zeros((360, 640), dtype=np.float32)
+    rembg_alpha[60:330, 70:550] = 1.0
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: rembg_alpha)
+
     mask, segmenter = _build_person_mask(rgb, faces)
 
     assert mask[150, 165] > 0
     assert mask[160, 455] > 0
-    assert segmenter in {
-        "rembg-birefnet-portrait",
-        "rembg-isnet-general-use",
-        "mediapipe-selfie-segmentation",
-        "face-fallback-person-mask",
-    }
+    assert segmenter == "rembg-birefnet-portrait"
 
 
 def test_person_mask_uses_rembg_alpha(monkeypatch) -> None:
@@ -158,7 +132,6 @@ def test_person_mask_uses_rembg_alpha(monkeypatch) -> None:
         return rembg_alpha if model_name == "birefnet-portrait" else None
 
     monkeypatch.setattr("purikura_demo.processing._run_rembg_model", fake_rembg)
-    monkeypatch.setattr("purikura_demo.processing._detect_person_with_mediapipe", lambda image: None)
 
     mask, segmenter = _build_person_mask(rgb, [])
 
@@ -167,7 +140,7 @@ def test_person_mask_uses_rembg_alpha(monkeypatch) -> None:
     assert mask[5, 5] < 16
 
 
-def test_rembg_mask_does_not_promote_face_fallback_outline(monkeypatch) -> None:
+def test_rembg_mask_does_not_promote_non_model_outline(monkeypatch) -> None:
     rgb = np.full((180, 180, 3), 235, dtype=np.uint8)
     rembg_alpha = np.zeros((180, 180), dtype=np.float32)
     rembg_alpha[70:155, 65:115] = 1.0
@@ -178,7 +151,6 @@ def test_rembg_mask_does_not_promote_face_fallback_outline(monkeypatch) -> None:
         return rembg_alpha if model_name == "birefnet-portrait" else None
 
     monkeypatch.setattr("purikura_demo.processing._run_rembg_model", fake_rembg)
-    monkeypatch.setattr("purikura_demo.processing._detect_person_with_mediapipe", lambda image: None)
 
     mask, segmenter = _build_person_mask(rgb, [face])
 
@@ -187,16 +159,13 @@ def test_rembg_mask_does_not_promote_face_fallback_outline(monkeypatch) -> None:
     assert mask[35, 85] < 48
 
 
-def test_person_mask_falls_back_when_rembg_unavailable(monkeypatch) -> None:
+def test_person_mask_fails_when_birefnet_unavailable(monkeypatch) -> None:
     rgb = np.full((160, 160, 3), 235, dtype=np.uint8)
     face = FaceRegion(45, 30, 70, 90, ((70.0, 65.0, 12.0), (92.0, 65.0, 12.0)))
     monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: None)
-    monkeypatch.setattr("purikura_demo.processing._detect_person_with_mediapipe", lambda image: None)
 
-    mask, segmenter = _build_person_mask(rgb, [face])
-
-    assert segmenter == "face-fallback-person-mask"
-    assert mask[75, 80] > 0
+    with pytest.raises(ValueError, match="birefnet-portrait"):
+        _build_person_mask(rgb, [face])
 
 
 def test_extract_rembg_alpha_accepts_rgba() -> None:
@@ -226,7 +195,7 @@ def test_part_masks_use_landmark_polygons() -> None:
     assert masks.lips.max() > 0
 
 
-def test_fallback_part_masks_include_side_hair() -> None:
+def test_manual_part_masks_include_side_hair() -> None:
     face = FaceRegion(100, 80, 180, 220, ((220.0, 158.0, 20.0), (160.0, 158.0, 20.0)))
 
     masks = _build_part_masks((420, 420), [face])
@@ -281,6 +250,84 @@ def _sample_face_image() -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def _install_quality_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_faces(image: np.ndarray) -> list[FaceRegion]:
+        return [_sample_mesh_face(image.shape[1], image.shape[0])]
+
+    def fake_rembg(image: np.ndarray, model_name: str) -> np.ndarray:
+        assert model_name == "birefnet-portrait"
+        mask = np.zeros(image.shape[:2], dtype=np.float32)
+        height, width = image.shape[:2]
+        mask[round(height * 0.08) : round(height * 0.96), round(width * 0.12) : round(width * 0.88)] = 1.0
+        return mask
+
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_and_eyes", fake_faces)
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", fake_rembg)
+
+
+def _sample_mesh_face(width: int, height: int) -> FaceRegion:
+    face_w = round(width * 0.48)
+    face_h = round(height * 0.44)
+    face_x = round((width - face_w) * 0.5)
+    face_y = round(height * 0.16)
+    landmarks = np.zeros((478, 2), dtype=np.float32)
+    _assign_polygon(
+        landmarks,
+        FACE_OVAL,
+        [
+            (face_x + face_w * 0.50, face_y),
+            (face_x + face_w * 0.92, face_y + face_h * 0.28),
+            (face_x + face_w * 0.82, face_y + face_h * 0.74),
+            (face_x + face_w * 0.50, face_y + face_h),
+            (face_x + face_w * 0.18, face_y + face_h * 0.74),
+            (face_x + face_w * 0.08, face_y + face_h * 0.28),
+        ],
+    )
+    _assign_polygon(
+        landmarks,
+        LEFT_EYE,
+        [
+            (face_x + face_w * 0.58, face_y + face_h * 0.38),
+            (face_x + face_w * 0.72, face_y + face_h * 0.38),
+            (face_x + face_w * 0.72, face_y + face_h * 0.46),
+            (face_x + face_w * 0.58, face_y + face_h * 0.46),
+        ],
+    )
+    _assign_polygon(
+        landmarks,
+        RIGHT_EYE,
+        [
+            (face_x + face_w * 0.28, face_y + face_h * 0.38),
+            (face_x + face_w * 0.42, face_y + face_h * 0.38),
+            (face_x + face_w * 0.42, face_y + face_h * 0.46),
+            (face_x + face_w * 0.28, face_y + face_h * 0.46),
+        ],
+    )
+    _assign_polygon(
+        landmarks,
+        NOSE,
+        [
+            (face_x + face_w * 0.46, face_y + face_h * 0.48),
+            (face_x + face_w * 0.54, face_y + face_h * 0.48),
+            (face_x + face_w * 0.58, face_y + face_h * 0.70),
+            (face_x + face_w * 0.42, face_y + face_h * 0.70),
+        ],
+    )
+    _assign_polygon(
+        landmarks,
+        LIPS,
+        [
+            (face_x + face_w * 0.36, face_y + face_h * 0.78),
+            (face_x + face_w * 0.64, face_y + face_h * 0.78),
+            (face_x + face_w * 0.58, face_y + face_h * 0.86),
+            (face_x + face_w * 0.42, face_y + face_h * 0.86),
+        ],
+    )
+    left_eye = (face_x + face_w * 0.65, face_y + face_h * 0.42, face_w * 0.08)
+    right_eye = (face_x + face_w * 0.35, face_y + face_h * 0.42, face_w * 0.08)
+    return FaceRegion(face_x, face_y, face_w, face_h, (left_eye, right_eye), landmarks, "mediapipe-face-mesh")
 
 
 def _assign_polygon(landmarks: np.ndarray, indices: tuple[int, ...], points: list[tuple[int, int]]) -> None:

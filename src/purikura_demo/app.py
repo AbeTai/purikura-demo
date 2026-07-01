@@ -67,7 +67,11 @@ async def process_image(
     try:
         result = apply_purikura_effect(source, settings)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return templates.TemplateResponse(
+            request,
+            "_error.html",
+            {"message": str(exc)},
+        )
 
     original_encoded = base64.b64encode(result.original_bytes).decode("ascii")
     processed_encoded = base64.b64encode(result.image_bytes).decode("ascii")
