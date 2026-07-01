@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 from dataclasses import asdict
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from PIL import Image
 
 from purikura_demo.processing import PurikuraSettings, apply_purikura_effect
 
@@ -49,6 +51,7 @@ async def process_image(
     decorations: bool = Form(False),
     white_background: bool = Form(PurikuraSettings.white_background),
 ) -> HTMLResponse:
+    from_camera = bool(camera_image.strip())
     source = await _read_source_image(image, camera_image)
 
     settings = PurikuraSettings(
@@ -67,10 +70,11 @@ async def process_image(
     try:
         result = apply_purikura_effect(source, settings)
     except ValueError as exc:
+        message = _camera_error_message(str(exc), source) if from_camera else str(exc)
         return templates.TemplateResponse(
             request,
             "_error.html",
-            {"message": str(exc)},
+            {"message": message},
         )
 
     original_encoded = base64.b64encode(result.original_bytes).decode("ascii")
@@ -125,3 +129,20 @@ def _decode_camera_data_url(data_url: str) -> bytes:
     if not source:
         raise HTTPException(status_code=400, detail="撮影画像が空です。")
     return source
+
+
+def _camera_error_message(message: str, source: bytes) -> str:
+    if "FaceMesh" not in message and "FaceLandmarker" not in message:
+        return message
+
+    size = "unknown"
+    try:
+        with Image.open(io.BytesIO(source)) as image:
+            size = f"{image.width}x{image.height}"
+    except OSError:
+        pass
+
+    return (
+        "撮影前チェックは通ったが、サーバ側FaceMesh / FaceLandmarkerで失敗しました。"
+        f"送信画像サイズ: {size}。顔をより正面・明るめにして撮り直してください。"
+    )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -30,7 +31,29 @@ def test_index_renders() -> None:
     assert "name=\"white_background\"" in response.text
     assert "data-input-mode=\"camera\"" in response.text
     assert "name=\"camera_image\"" in response.text
+    assert "id=\"camera-overlay\"" in response.text
     assert "camera.js" in response.text
+
+
+def test_camera_script_requires_browser_face_landmarker() -> None:
+    script = _camera_script()
+
+    assert "@mediapipe/tasks-vision" in script
+    assert "FACE_MODEL_URL" in script
+    assert "FaceLandmarker.createFromOptions" in script
+    assert "detectForVideo" in script
+    assert "顔を中央に入れてください" in script
+
+
+def test_camera_script_blocks_submit_until_face_detected() -> None:
+    script = _camera_script()
+
+    assert "lastFaceBox" in script
+    assert "captureButton.disabled = !(stream && detectorReady && lastFaceBox)" in script
+    assert "顔を検出してから撮影してください" in script
+    assert "OUTPUT_WIDTH = 960" in script
+    assert "OUTPUT_HEIGHT = 1200" in script
+    assert "cropFromFaceBox" in script
 
 
 def test_process_image_returns_result_partial(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,6 +110,35 @@ def test_process_image_returns_quality_error_without_required_models() -> None:
     assert response.status_code == 200
     assert "処理できませんでした" in response.text
     assert "birefnet-portrait" in response.text
+
+
+def test_process_camera_image_returns_specific_face_detection_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_rembg(image: np.ndarray, model_name: str) -> np.ndarray:
+        assert model_name == "birefnet-portrait"
+        return np.ones(image.shape[:2], dtype=np.float32)
+
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", fake_rembg)
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_and_eyes", lambda image, person_mask=None: [])
+    client = TestClient(app)
+    image_data = base64.b64encode(_sample_image()).decode("ascii")
+    response = client.post(
+        "/process",
+        data={
+            "camera_image": f"data:image/png;base64,{image_data}",
+            "preset": "natural",
+            "pipeline": "quality",
+            "effect_mode": "strong",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "処理できませんでした" in response.text
+    assert "撮影前チェックは通ったが" in response.text
+    assert "送信画像サイズ: 320x240" in response.text
+
+
+def _camera_script() -> str:
+    return (Path(__file__).resolve().parents[1] / "src/purikura_demo/static/camera.js").read_text()
 
 
 def _sample_image() -> bytes:
