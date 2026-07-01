@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import binascii
 import io
+import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 
@@ -40,6 +42,7 @@ async def process_image(
     request: Request,
     image: UploadFile | None = File(None),
     camera_image: str = Form(""),
+    camera_landmarks: str = Form(""),
     preset: str = Form(PurikuraSettings.preset),
     pipeline: str = Form("quality"),
     effect_mode: str = Form(PurikuraSettings.effect_mode),
@@ -53,6 +56,7 @@ async def process_image(
 ) -> HTMLResponse:
     from_camera = bool(camera_image.strip())
     source = await _read_source_image(image, camera_image)
+    landmark_faces = _decode_camera_landmarks(camera_landmarks) if from_camera else None
 
     settings = PurikuraSettings(
         preset=preset,
@@ -68,7 +72,7 @@ async def process_image(
     )
 
     try:
-        result = apply_purikura_effect(source, settings)
+        result = apply_purikura_effect(source, settings, face_landmarks=landmark_faces)
     except ValueError as exc:
         message = _camera_error_message(str(exc), source) if from_camera else str(exc)
         return templates.TemplateResponse(
@@ -129,6 +133,40 @@ def _decode_camera_data_url(data_url: str) -> bytes:
     if not source:
         raise HTTPException(status_code=400, detail="撮影画像が空です。")
     return source
+
+
+def _decode_camera_landmarks(payload: str) -> list[list[tuple[float, float]]] | None:
+    payload = payload.strip()
+    if not payload:
+        return None
+
+    try:
+        raw_faces = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="撮影前顔検出データの形式が不正です。") from exc
+
+    if not isinstance(raw_faces, list):
+        raise HTTPException(status_code=400, detail="撮影前顔検出データの形式が不正です。")
+
+    faces: list[list[tuple[float, float]]] = []
+    for raw_face in raw_faces:
+        if not isinstance(raw_face, list):
+            continue
+        points: list[tuple[float, float]] = []
+        for point in raw_face:
+            if not isinstance(point, dict):
+                continue
+            try:
+                x = float(point["x"])
+                y = float(point["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(x) and math.isfinite(y):
+                points.append((x, y))
+        if len(points) >= 468:
+            faces.append(points)
+
+    return faces or None
 
 
 def _camera_error_message(message: str, source: bytes) -> str:

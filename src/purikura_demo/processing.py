@@ -137,13 +137,19 @@ class FaceRegion:
         return (self.x + self.w * 0.5, self.y + self.h * 0.52)
 
 
-def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> ProcessedImage:
+def apply_purikura_effect(
+    source_bytes: bytes,
+    settings: PurikuraSettings,
+    face_landmarks: list[list[tuple[float, float]]] | None = None,
+) -> ProcessedImage:
     image = _decode_image(source_bytes)
     image = _resize_to_limit(image, max_side=1800)
     rgb = np.array(image, dtype=np.uint8)
 
     settings = _clamp_settings(settings)
-    faces = _detect_faces_and_eyes(rgb)
+    faces = _faces_from_normalized_landmarks(face_landmarks, rgb.shape[1], rgb.shape[0]) if face_landmarks else []
+    if not faces:
+        faces = _detect_faces_and_eyes(rgb)
     person_mask: np.ndarray | None = None
     background_segmenter = ""
     if not faces:
@@ -253,6 +259,30 @@ def _effective_strength(value: float, settings: PurikuraSettings, cap: float = 1
 
 def _detect_faces_and_eyes(rgb: np.ndarray, person_mask: np.ndarray | None = None) -> list[FaceRegion]:
     return _detect_faces_with_mediapipe(rgb, person_mask)
+
+
+def _faces_from_normalized_landmarks(
+    face_landmarks: list[list[tuple[float, float]]] | None,
+    width: int,
+    height: int,
+) -> list[FaceRegion]:
+    if not face_landmarks:
+        return []
+
+    faces: list[FaceRegion] = []
+    for face in face_landmarks:
+        landmarks = np.array(face, dtype=np.float32)
+        if landmarks.ndim != 2 or landmarks.shape[0] < 468 or landmarks.shape[1] < 2:
+            continue
+        landmarks = landmarks[:, :2]
+        if not np.isfinite(landmarks).all():
+            continue
+        landmarks[:, 0] = np.clip(landmarks[:, 0], 0.0, 1.0) * width
+        landmarks[:, 1] = np.clip(landmarks[:, 1], 0.0, 1.0) * height
+        region = _face_region_from_landmarks(landmarks, width, height, "mediapipe-face-mesh")
+        if region is not None:
+            faces.append(region)
+    return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
 
 
 def _detect_faces_with_mediapipe(rgb: np.ndarray, person_mask: np.ndarray | None = None) -> list[FaceRegion]:
@@ -493,26 +523,9 @@ def _faces_from_mediapipe_result(
         if candidate_landmarks.shape[0] < 468:
             continue
         landmarks = candidate_landmarks / max(scale, 1e-6) + np.array([offset_x, offset_y], dtype=np.float32)
-        x0, y0 = np.floor(np.min(landmarks[:, :2], axis=0)).astype(int)
-        x1, y1 = np.ceil(np.max(landmarks[:, :2], axis=0)).astype(int)
-        x0 = max(0, min(x0, width - 1))
-        y0 = max(0, min(y0, height - 1))
-        x1 = max(x0 + 1, min(x1, width))
-        y1 = max(y0 + 1, min(y1, height))
-
-        left_eye = _eye_from_landmarks(landmarks, LEFT_EYE, LEFT_IRIS)
-        right_eye = _eye_from_landmarks(landmarks, RIGHT_EYE, RIGHT_IRIS)
-        faces.append(
-            FaceRegion(
-                x=x0,
-                y=y0,
-                w=x1 - x0,
-                h=y1 - y0,
-                eyes=(left_eye, right_eye),
-                landmarks=landmarks,
-                detector="mediapipe-face-mesh",
-            )
-        )
+        region = _face_region_from_landmarks(landmarks, width, height, "mediapipe-face-mesh")
+        if region is not None:
+            faces.append(region)
     return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
 
 
@@ -535,27 +548,41 @@ def _faces_from_task_result(
         if candidate_landmarks.shape[0] < 468:
             continue
         landmarks = candidate_landmarks / max(scale, 1e-6) + np.array([offset_x, offset_y], dtype=np.float32)
-        x0, y0 = np.floor(np.min(landmarks[:, :2], axis=0)).astype(int)
-        x1, y1 = np.ceil(np.max(landmarks[:, :2], axis=0)).astype(int)
-        x0 = max(0, min(x0, width - 1))
-        y0 = max(0, min(y0, height - 1))
-        x1 = max(x0 + 1, min(x1, width))
-        y1 = max(y0 + 1, min(y1, height))
-
-        left_eye = _eye_from_landmarks(landmarks, LEFT_EYE, LEFT_IRIS)
-        right_eye = _eye_from_landmarks(landmarks, RIGHT_EYE, RIGHT_IRIS)
-        faces.append(
-            FaceRegion(
-                x=x0,
-                y=y0,
-                w=x1 - x0,
-                h=y1 - y0,
-                eyes=(left_eye, right_eye),
-                landmarks=landmarks,
-                detector="mediapipe-face-mesh",
-            )
-        )
+        region = _face_region_from_landmarks(landmarks, width, height, "mediapipe-face-mesh")
+        if region is not None:
+            faces.append(region)
     return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
+
+
+def _face_region_from_landmarks(
+    landmarks: np.ndarray,
+    width: int,
+    height: int,
+    detector: str,
+) -> FaceRegion | None:
+    if landmarks.shape[0] < 468:
+        return None
+
+    x0, y0 = np.floor(np.min(landmarks[:, :2], axis=0)).astype(int)
+    x1, y1 = np.ceil(np.max(landmarks[:, :2], axis=0)).astype(int)
+    x0 = max(0, min(x0, width - 1))
+    y0 = max(0, min(y0, height - 1))
+    x1 = max(x0 + 1, min(x1, width))
+    y1 = max(y0 + 1, min(y1, height))
+    if x1 - x0 < 24 or y1 - y0 < 24:
+        return None
+
+    left_eye = _eye_from_landmarks(landmarks, LEFT_EYE, LEFT_IRIS)
+    right_eye = _eye_from_landmarks(landmarks, RIGHT_EYE, RIGHT_IRIS)
+    return FaceRegion(
+        x=x0,
+        y=y0,
+        w=x1 - x0,
+        h=y1 - y0,
+        eyes=(left_eye, right_eye),
+        landmarks=landmarks,
+        detector=detector,
+    )
 
 
 def _eye_from_landmarks(

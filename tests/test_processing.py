@@ -20,6 +20,7 @@ from purikura_demo.processing import (
     _build_skin_mask,
     _detect_faces_and_eyes,
     _extract_rembg_alpha,
+    _faces_from_normalized_landmarks,
     _refine_hair_mask,
     suppress_mask_on_edges,
     apply_purikura_effect,
@@ -96,6 +97,17 @@ def test_face_detection_requires_mediapipe_mesh(monkeypatch) -> None:
     faces = _detect_faces_and_eyes(rgb)
 
     assert faces == []
+
+
+def test_browser_landmarks_create_mediapipe_face_region() -> None:
+    faces = _faces_from_normalized_landmarks([_sample_normalized_landmarks()], width=960, height=1200)
+
+    assert len(faces) == 1
+    assert faces[0].detector == "mediapipe-face-mesh"
+    assert faces[0].landmarks is not None
+    assert faces[0].w > 300
+    assert faces[0].h > 500
+    assert faces[0].eyes[0][0] > faces[0].eyes[1][0]
 
 
 def test_no_face_fails_instead_of_using_soft_mask(monkeypatch) -> None:
@@ -332,6 +344,32 @@ def _sample_mesh_face(width: int, height: int) -> FaceRegion:
     left_eye = (face_x + face_w * 0.65, face_y + face_h * 0.42, face_w * 0.08)
     right_eye = (face_x + face_w * 0.35, face_y + face_h * 0.42, face_w * 0.08)
     return FaceRegion(face_x, face_y, face_w, face_h, (left_eye, right_eye), landmarks, "mediapipe-face-mesh")
+
+
+def _sample_normalized_landmarks() -> list[tuple[float, float]]:
+    points = [(0.50, 0.45) for _ in range(478)]
+    _assign_normalized_polygon(
+        points,
+        FACE_OVAL,
+        [
+            (0.50, 0.20),
+            (0.72, 0.34),
+            (0.66, 0.62),
+            (0.50, 0.72),
+            (0.34, 0.62),
+            (0.28, 0.34),
+        ],
+    )
+    _assign_normalized_polygon(points, LEFT_EYE, [(0.56, 0.40), (0.65, 0.44)])
+    _assign_normalized_polygon(points, RIGHT_EYE, [(0.35, 0.40), (0.44, 0.44)])
+    _assign_normalized_polygon(points, (469, 470, 471, 472), [(0.395, 0.42)])
+    _assign_normalized_polygon(points, (474, 475, 476, 477), [(0.605, 0.42)])
+    return points
+
+
+def _assign_normalized_polygon(points: list[tuple[float, float]], indices: tuple[int, ...], polygon: list[tuple[float, float]]) -> None:
+    for offset, index in enumerate(indices):
+        points[index] = polygon[offset % len(polygon)]
 
 
 def _assign_polygon(landmarks: np.ndarray, indices: tuple[int, ...], points: list[tuple[int, int]]) -> None:

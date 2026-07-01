@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,7 @@ def test_index_renders() -> None:
     assert "name=\"white_background\"" in response.text
     assert "data-input-mode=\"camera\"" in response.text
     assert "name=\"camera_image\"" in response.text
+    assert "name=\"camera_landmarks\"" in response.text
     assert "id=\"camera-overlay\"" in response.text
     assert "camera.js" in response.text
 
@@ -42,6 +44,7 @@ def test_camera_script_requires_browser_face_landmarker() -> None:
     assert "FACE_MODEL_URL" in script
     assert "FaceLandmarker.createFromOptions" in script
     assert "detectForVideo" in script
+    assert "numFaces: 8" in script
     assert "顔を中央に入れてください" in script
 
 
@@ -54,6 +57,8 @@ def test_camera_script_blocks_submit_until_face_detected() -> None:
     assert "OUTPUT_WIDTH = 960" in script
     assert "OUTPUT_HEIGHT = 1200" in script
     assert "cropFromFaceBox" in script
+    assert "landmarksForOutputImage" in script
+    assert "#camera_landmarks" in script
 
 
 def test_process_image_returns_result_partial(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,6 +102,35 @@ def test_process_camera_image_returns_result_partial(monkeypatch: pytest.MonkeyP
     assert "data:image/jpeg;base64" in response.text
     assert "Processed" in response.text
     assert "Background Debug" in response.text
+
+
+def test_process_camera_image_uses_browser_landmarks_when_server_detection_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_rembg(image: np.ndarray, model_name: str) -> np.ndarray:
+        assert model_name == "birefnet-portrait"
+        mask = np.zeros(image.shape[:2], dtype=np.float32)
+        height, width = image.shape[:2]
+        mask[round(height * 0.08) : round(height * 0.96), round(width * 0.12) : round(width * 0.88)] = 1.0
+        return mask
+
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_and_eyes", lambda image, person_mask=None: [])
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", fake_rembg)
+    client = TestClient(app)
+    image_data = base64.b64encode(_sample_image()).decode("ascii")
+    response = client.post(
+        "/process",
+        data={
+            "camera_image": f"data:image/png;base64,{image_data}",
+            "camera_landmarks": json.dumps([_sample_normalized_landmarks()]),
+            "preset": "natural",
+            "pipeline": "quality",
+            "effect_mode": "strong",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "data:image/jpeg;base64" in response.text
+    assert "Processed" in response.text
+    assert "mediapipe-face-mesh" in response.text
 
 
 def test_process_image_returns_quality_error_without_required_models() -> None:
@@ -146,6 +180,35 @@ def _sample_image() -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def _sample_normalized_landmarks() -> list[dict[str, float]]:
+    points = [{"x": 0.50, "y": 0.45} for _ in range(478)]
+    _assign_normalized_polygon(
+        points,
+        FACE_OVAL,
+        [
+            (0.50, 0.20),
+            (0.72, 0.34),
+            (0.66, 0.62),
+            (0.50, 0.72),
+            (0.34, 0.62),
+            (0.28, 0.34),
+        ],
+    )
+    _assign_normalized_polygon(points, LEFT_EYE, [(0.56, 0.40), (0.65, 0.44)])
+    _assign_normalized_polygon(points, RIGHT_EYE, [(0.35, 0.40), (0.44, 0.44)])
+    _assign_normalized_polygon(points, NOSE, [(0.46, 0.47), (0.54, 0.58)])
+    _assign_normalized_polygon(points, LIPS, [(0.42, 0.62), (0.58, 0.67)])
+    _assign_normalized_polygon(points, (469, 470, 471, 472), [(0.395, 0.42)])
+    _assign_normalized_polygon(points, (474, 475, 476, 477), [(0.605, 0.42)])
+    return points
+
+
+def _assign_normalized_polygon(points: list[dict[str, float]], indices: tuple[int, ...], polygon: list[tuple[float, float]]) -> None:
+    for offset, index in enumerate(indices):
+        x, y = polygon[offset % len(polygon)]
+        points[index] = {"x": x, "y": y}
 
 
 def _install_quality_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:

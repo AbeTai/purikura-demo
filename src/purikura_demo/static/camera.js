@@ -16,6 +16,7 @@
   const uploadPanel = root.querySelector("[data-upload-panel]");
   const cameraPanel = root.querySelector("[data-camera-panel]");
   const cameraImage = root.querySelector("#camera_image");
+  const cameraLandmarks = root.querySelector("#camera_landmarks");
   const video = root.querySelector("#camera-preview");
   const overlay = root.querySelector("#camera-overlay");
   const canvas = root.querySelector("#camera-canvas");
@@ -30,6 +31,7 @@
   let detectorReady = false;
   let detecting = false;
   let lastFaceBox = null;
+  let lastFaceLandmarks = null;
   let lastVideoTime = -1;
 
   function setStatus(message) {
@@ -59,6 +61,7 @@
     } else {
       stopCamera();
       if (cameraImage) cameraImage.value = "";
+      if (cameraLandmarks) cameraLandmarks.value = "";
       setStatus("");
     }
   }
@@ -78,7 +81,7 @@
         delegate: "CPU",
       },
       runningMode: "VIDEO",
-      numFaces: 1,
+      numFaces: 8,
     });
     detectorReady = true;
     return faceLandmarker;
@@ -96,6 +99,7 @@
     }
 
     lastFaceBox = null;
+    lastFaceLandmarks = null;
     detectorReady = false;
     setCaptureEnabled();
     drawGuideOverlay();
@@ -126,6 +130,7 @@
     detecting = false;
     lastVideoTime = -1;
     lastFaceBox = null;
+    lastFaceLandmarks = null;
     if (stream) {
       stream.getTracks().forEach((track) => track.stop());
       stream = null;
@@ -146,19 +151,22 @@
       lastVideoTime = video.currentTime;
       try {
         const result = faceLandmarker.detectForVideo(video, performance.now());
-        const landmarks = result.faceLandmarks?.[0];
-        if (landmarks?.length) {
-          lastFaceBox = faceBoxFromLandmarks(landmarks);
+        const faces = result.faceLandmarks || [];
+        if (faces.length > 0 && faces[0]?.length) {
+          lastFaceBox = faceBoxFromLandmarkFaces(faces);
+          lastFaceLandmarks = faces;
           drawFaceOverlay(lastFaceBox);
           setStatus("顔を検出しました。");
         } else {
           lastFaceBox = null;
+          lastFaceLandmarks = null;
           drawGuideOverlay();
           setStatus("顔を中央に入れてください。");
         }
       } catch (error) {
         console.error(error);
         lastFaceBox = null;
+        lastFaceLandmarks = null;
         drawGuideOverlay();
         setStatus("顔検出に失敗しました。顔を中央に入れてください。");
       }
@@ -192,7 +200,7 @@
       setStatus("カメラを起動してください。");
       return;
     }
-    if (!lastFaceBox) {
+    if (!lastFaceBox || !lastFaceLandmarks?.length) {
       setStatus("顔を検出してから撮影してください。");
       return;
     }
@@ -208,9 +216,27 @@
     context.restore();
 
     if (cameraImage) cameraImage.value = canvas.toDataURL("image/jpeg", 0.94);
+    if (cameraLandmarks) {
+      cameraLandmarks.value = JSON.stringify(
+        lastFaceLandmarks.map((landmarks) => landmarksForOutputImage(landmarks, crop, video.videoWidth, video.videoHeight)),
+      );
+    }
     if (fileInput) fileInput.value = "";
     if (fileLabel) fileLabel.textContent = "画像を選択";
     form?.requestSubmit(submitButton || undefined);
+  }
+
+  function landmarksForOutputImage(landmarks, crop, videoWidth, videoHeight) {
+    return landmarks.map((point) => {
+      const rawX = point.x * videoWidth;
+      const rawY = point.y * videoHeight;
+      const croppedX = clamp((rawX - crop.x) / crop.width, -0.25, 1.25);
+      const croppedY = clamp((rawY - crop.y) / crop.height, -0.25, 1.25);
+      return {
+        x: clamp(1 - croppedX, -0.25, 1.25),
+        y: croppedY,
+      };
+    });
   }
 
   function cropFromFaceBox(box, videoWidth, videoHeight) {
@@ -222,6 +248,10 @@
     const cropW = cropH * OUTPUT_RATIO;
     const centerY = faceCenterY + faceH * 0.58;
     return clampCropToVideo(faceCenterX - cropW * 0.5, centerY - cropH * 0.5, cropW, cropH, videoWidth, videoHeight);
+  }
+
+  function faceBoxFromLandmarkFaces(faces) {
+    return faceBoxFromLandmarks(faces.flat());
   }
 
   function clampCropToVideo(x, y, width, height, videoWidth, videoHeight) {
@@ -296,6 +326,7 @@
   fileInput?.addEventListener("change", () => {
     if (fileLabel) fileLabel.textContent = fileInput.files?.[0]?.name || "画像を選択";
     if (cameraImage) cameraImage.value = "";
+    if (cameraLandmarks) cameraLandmarks.value = "";
   });
   window.addEventListener("resize", () => {
     if (lastFaceBox) {
