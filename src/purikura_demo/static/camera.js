@@ -85,12 +85,22 @@
       return;
     }
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    const targetRatio = 4 / 5;
+    let sourceWidth = video.videoWidth;
+    let sourceHeight = sourceWidth / targetRatio;
+    if (sourceHeight > video.videoHeight) {
+      sourceHeight = video.videoHeight;
+      sourceWidth = sourceHeight * targetRatio;
+    }
+    const sourceX = (video.videoWidth - sourceWidth) / 2;
+    const sourceY = Math.max(0, (video.videoHeight - sourceHeight) * 0.34);
+
+    canvas.width = 960;
+    canvas.height = 1200;
     const context = canvas.getContext("2d", { alpha: false });
     context.translate(canvas.width, 0);
     context.scale(-1, 1);
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    context.drawImage(video, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
     cameraImage.value = canvas.toDataURL("image/jpeg", 0.94);
     fileInput.value = "";
     fileLabel.textContent = "画像を選択";

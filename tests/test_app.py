@@ -15,6 +15,7 @@ from purikura_demo.processing import FACE_OVAL, LEFT_EYE, LIPS, NOSE, RIGHT_EYE,
 @pytest.fixture(autouse=True)
 def disable_rembg_model_download(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: None)
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_with_mediapipe_tasks", lambda image, person_mask=None: [])
 
 
 def test_index_renders() -> None:
@@ -85,7 +86,7 @@ def test_process_image_returns_quality_error_without_required_models() -> None:
 
     assert response.status_code == 200
     assert "処理できませんでした" in response.text
-    assert "MediaPipe FaceMesh" in response.text
+    assert "birefnet-portrait" in response.text
 
 
 def _sample_image() -> bytes:

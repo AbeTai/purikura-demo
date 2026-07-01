@@ -4,11 +4,15 @@ import io
 import math
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
+from urllib.request import urlretrieve
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
+
+FACE_LANDMARKER_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 
 FACE_OVAL = (
     10,
@@ -140,6 +144,11 @@ def apply_purikura_effect(source_bytes: bytes, settings: PurikuraSettings) -> Pr
 
     settings = _clamp_settings(settings)
     faces = _detect_faces_and_eyes(rgb)
+    person_mask: np.ndarray | None = None
+    background_segmenter = ""
+    if not faces:
+        person_mask, background_segmenter = _build_person_mask(rgb, [])
+        faces = _detect_faces_and_eyes(rgb, person_mask)
     if not faces:
         raise ValueError("MediaPipe FaceMeshで顔を検出できませんでした。顔が正面に入り、明るい状態で撮り直してください。")
 
@@ -242,11 +251,11 @@ def _effective_strength(value: float, settings: PurikuraSettings, cap: float = 1
     return min(cap, value * _mode_multiplier(settings))
 
 
-def _detect_faces_and_eyes(rgb: np.ndarray) -> list[FaceRegion]:
-    return _detect_faces_with_mediapipe(rgb)
+def _detect_faces_and_eyes(rgb: np.ndarray, person_mask: np.ndarray | None = None) -> list[FaceRegion]:
+    return _detect_faces_with_mediapipe(rgb, person_mask)
 
 
-def _detect_faces_with_mediapipe(rgb: np.ndarray) -> list[FaceRegion]:
+def _detect_faces_with_mediapipe(rgb: np.ndarray, person_mask: np.ndarray | None = None) -> list[FaceRegion]:
     try:
         import mediapipe as mp  # type: ignore[import-not-found]
     except Exception:
@@ -260,7 +269,7 @@ def _detect_faces_with_mediapipe(rgb: np.ndarray) -> list[FaceRegion]:
             refine_landmarks=True,
             min_detection_confidence=0.28,
         ) as face_mesh:
-            for candidate, offset_x, offset_y, scale in _face_mesh_input_candidates(rgb):
+            for candidate, offset_x, offset_y, scale in _face_mesh_input_candidates(rgb, person_mask):
                 result = face_mesh.process(candidate)
                 faces = _faces_from_mediapipe_result(
                     result,
@@ -277,10 +286,65 @@ def _detect_faces_with_mediapipe(rgb: np.ndarray) -> list[FaceRegion]:
     except Exception:
         return []
 
+    return _detect_faces_with_mediapipe_tasks(rgb, person_mask)
+
+
+def _detect_faces_with_mediapipe_tasks(rgb: np.ndarray, person_mask: np.ndarray | None = None) -> list[FaceRegion]:
+    try:
+        import mediapipe as mp  # type: ignore[import-not-found]
+    except Exception:
+        return []
+
+    height, width = rgb.shape[:2]
+    try:
+        landmarker = _mediapipe_face_landmarker()
+        for candidate, offset_x, offset_y, scale in _face_mesh_input_candidates(rgb, person_mask):
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(candidate))
+            result = landmarker.detect(mp_image)
+            faces = _faces_from_task_result(
+                result,
+                width,
+                height,
+                candidate.shape[1],
+                candidate.shape[0],
+                offset_x,
+                offset_y,
+                scale,
+            )
+            if faces:
+                return faces
+    except Exception:
+        return []
+
     return []
 
 
-def _face_mesh_input_candidates(rgb: np.ndarray) -> tuple[tuple[np.ndarray, float, float, float], ...]:
+@lru_cache(maxsize=1)
+def _mediapipe_face_landmarker() -> Any:
+    from mediapipe.tasks import python  # type: ignore[import-not-found]
+    from mediapipe.tasks.python import vision  # type: ignore[import-not-found]
+
+    options = vision.FaceLandmarkerOptions(
+        base_options=python.BaseOptions(model_asset_path=str(_face_landmarker_model_path())),
+        running_mode=vision.RunningMode.IMAGE,
+        num_faces=8,
+    )
+    return vision.FaceLandmarker.create_from_options(options)
+
+
+@lru_cache(maxsize=1)
+def _face_landmarker_model_path() -> Path:
+    model_path = Path.home() / ".cache" / "purikura-demo" / "face_landmarker.task"
+    if not model_path.exists():
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        urlretrieve(FACE_LANDMARKER_URL, model_path)
+    return model_path
+
+
+def _face_mesh_input_candidates(
+    rgb: np.ndarray,
+    person_mask: np.ndarray | None = None,
+) -> tuple[tuple[np.ndarray, float, float, float], ...]:
     height, width = rgb.shape[:2]
     crops = [
         (0, 0, width, height),
@@ -288,6 +352,9 @@ def _face_mesh_input_candidates(rgb: np.ndarray) -> tuple[tuple[np.ndarray, floa
         (round(width * 0.18), round(height * 0.04), round(width * 0.82), height),
     ]
     crops.extend(_face_detection_crop_proposals(rgb))
+    crops.extend(_cv2_face_crop_proposals(rgb))
+    if person_mask is not None:
+        crops.extend(_person_mask_face_crop_proposals(person_mask))
     candidates: list[tuple[np.ndarray, float, float, float]] = []
     for x0, y0, x1, y1 in crops:
         crop = rgb[y0:y1, x0:x1]
@@ -298,6 +365,29 @@ def _face_mesh_input_candidates(rgb: np.ndarray) -> tuple[tuple[np.ndarray, floa
         for variant in _face_mesh_image_variants(scaled):
             candidates.append((variant, float(x0), float(y0), scale))
     return tuple(candidates)
+
+
+def _cv2_face_crop_proposals(rgb: np.ndarray) -> list[tuple[int, int, int, int]]:
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    if detector.empty():
+        return []
+
+    height, width = gray.shape[:2]
+    min_side = max(48, min(height, width) // 10)
+    boxes = detector.detectMultiScale(gray, scaleFactor=1.06, minNeighbors=4, minSize=(min_side, min_side))
+    proposals: list[tuple[int, int, int, int]] = []
+    for x, y, w, h in boxes:
+        pad_x = round(w * 0.60)
+        pad_top = round(h * 0.70)
+        pad_bottom = round(h * 0.92)
+        x0 = max(0, int(x) - pad_x)
+        y0 = max(0, int(y) - pad_top)
+        x1 = min(width, int(x + w) + pad_x)
+        y1 = min(height, int(y + h) + pad_bottom)
+        if x1 - x0 >= 48 and y1 - y0 >= 48:
+            proposals.append((x0, y0, x1, y1))
+    return proposals
 
 
 def _face_detection_crop_proposals(rgb: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -335,6 +425,36 @@ def _face_detection_crop_proposals(rgb: np.ndarray) -> list[tuple[int, int, int,
     return proposals
 
 
+def _person_mask_face_crop_proposals(person_mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    alpha = person_mask.astype(np.float32)
+    if alpha.max() > 1.0:
+        alpha /= 255.0
+    ys, xs = np.where(alpha > 0.18)
+    if len(xs) == 0:
+        return []
+
+    height, width = person_mask.shape[:2]
+    x0 = int(xs.min())
+    x1 = int(xs.max()) + 1
+    y0 = int(ys.min())
+    y1 = int(ys.max()) + 1
+    person_w = max(1, x1 - x0)
+    person_h = max(1, y1 - y0)
+    cx = (x0 + x1) * 0.5
+
+    proposals: list[tuple[int, int, int, int]] = []
+    for head_ratio, side_scale in ((0.48, 0.72), (0.58, 0.86), (0.68, 1.00)):
+        crop_h = person_h * head_ratio
+        crop_w = max(person_w * side_scale, crop_h * 0.78)
+        top = max(0.0, y0 - crop_h * 0.10)
+        bottom = min(float(height), top + crop_h)
+        left = max(0.0, cx - crop_w * 0.5)
+        right = min(float(width), cx + crop_w * 0.5)
+        if right - left >= 48 and bottom - top >= 48:
+            proposals.append((round(left), round(top), round(right), round(bottom)))
+    return proposals
+
+
 def _scale_face_mesh_candidate(rgb: np.ndarray) -> tuple[np.ndarray, float]:
     height, width = rgb.shape[:2]
     target = 960
@@ -368,6 +488,48 @@ def _faces_from_mediapipe_result(
     for face_landmarks in result.multi_face_landmarks or []:
         candidate_landmarks = np.array(
             [(point.x * candidate_width, point.y * candidate_height) for point in face_landmarks.landmark],
+            dtype=np.float32,
+        )
+        if candidate_landmarks.shape[0] < 468:
+            continue
+        landmarks = candidate_landmarks / max(scale, 1e-6) + np.array([offset_x, offset_y], dtype=np.float32)
+        x0, y0 = np.floor(np.min(landmarks[:, :2], axis=0)).astype(int)
+        x1, y1 = np.ceil(np.max(landmarks[:, :2], axis=0)).astype(int)
+        x0 = max(0, min(x0, width - 1))
+        y0 = max(0, min(y0, height - 1))
+        x1 = max(x0 + 1, min(x1, width))
+        y1 = max(y0 + 1, min(y1, height))
+
+        left_eye = _eye_from_landmarks(landmarks, LEFT_EYE, LEFT_IRIS)
+        right_eye = _eye_from_landmarks(landmarks, RIGHT_EYE, RIGHT_IRIS)
+        faces.append(
+            FaceRegion(
+                x=x0,
+                y=y0,
+                w=x1 - x0,
+                h=y1 - y0,
+                eyes=(left_eye, right_eye),
+                landmarks=landmarks,
+                detector="mediapipe-face-mesh",
+            )
+        )
+    return sorted(faces, key=lambda face: face.w * face.h, reverse=True)
+
+
+def _faces_from_task_result(
+    result: Any,
+    width: int,
+    height: int,
+    candidate_width: int,
+    candidate_height: int,
+    offset_x: float,
+    offset_y: float,
+    scale: float,
+) -> list[FaceRegion]:
+    faces: list[FaceRegion] = []
+    for face_landmarks in getattr(result, "face_landmarks", []) or []:
+        candidate_landmarks = np.array(
+            [(point.x * candidate_width, point.y * candidate_height) for point in face_landmarks],
             dtype=np.float32,
         )
         if candidate_landmarks.shape[0] < 468:

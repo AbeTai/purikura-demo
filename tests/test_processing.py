@@ -29,6 +29,7 @@ from purikura_demo.processing import (
 @pytest.fixture(autouse=True)
 def disable_rembg_model_download(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: None)
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_with_mediapipe_tasks", lambda image, person_mask=None: [])
 
 
 def test_apply_purikura_effect_returns_jpeg(monkeypatch) -> None:
@@ -90,7 +91,7 @@ def test_skin_mask_combines_multiple_faces() -> None:
 
 def test_face_detection_requires_mediapipe_mesh(monkeypatch) -> None:
     rgb = np.full((720, 1280, 3), 235, dtype=np.uint8)
-    monkeypatch.setattr("purikura_demo.processing._detect_faces_with_mediapipe", lambda image: [])
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_with_mediapipe", lambda image, person_mask=None: [])
 
     faces = _detect_faces_and_eyes(rgb)
 
@@ -98,7 +99,10 @@ def test_face_detection_requires_mediapipe_mesh(monkeypatch) -> None:
 
 
 def test_no_face_fails_instead_of_using_soft_mask(monkeypatch) -> None:
-    monkeypatch.setattr("purikura_demo.processing._detect_faces_and_eyes", lambda image: [])
+    person_mask = np.zeros((560, 420), dtype=np.float32)
+    person_mask[70:520, 90:330] = 1.0
+    monkeypatch.setattr("purikura_demo.processing._detect_faces_and_eyes", lambda image, person_mask=None: [])
+    monkeypatch.setattr("purikura_demo.processing._run_rembg_model", lambda image, model_name: person_mask)
 
     with pytest.raises(ValueError, match="MediaPipe FaceMesh"):
         apply_purikura_effect(_sample_face_image(), PurikuraSettings(preset="natural"))
